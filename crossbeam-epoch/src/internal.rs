@@ -37,7 +37,6 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::mem::{self, ManuallyDrop};
-use core::num::Wrapping;
 use core::ptr;
 use core::sync::atomic;
 use core::sync::atomic::Ordering;
@@ -262,16 +261,17 @@ pub struct Local {
     /// The number of active handles.
     handle_count: Cell<usize>,
 
-    /// Total number of pinnings performed.
-    ///
     /// This is just an auxilliary counter that sometimes kicks off collection.
-    pin_count: Cell<Wrapping<usize>>,
+    collect_count: Cell<usize>,
+    advance_count: Cell<usize>,
 }
 
 impl Local {
     /// Number of pinnings after which a participant will execute some deferred functions from the
     /// global queue.
-    const PINNINGS_BETWEEN_COLLECT: usize = 128;
+    const COUNTS_BETWEEN_COLLECT: usize = 64;
+
+    const COUNTS_BETWEEN_TRY_ADVANCE: usize = 128;
 
     /// Registers a new `Local` in the provided `Global`.
     pub fn register(collector: &Collector) -> LocalHandle {
@@ -285,7 +285,8 @@ impl Local {
                 bag: UnsafeCell::new(Bag::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
-                pin_count: Cell::new(Wrapping(0)),
+                collect_count: Cell::new(0),
+                advance_count: Cell::new(0),
             })
             .into_shared(&unprotected());
             collector.global.locals.insert(local, &unprotected());
@@ -313,6 +314,22 @@ impl Local {
         self.guard_count.get() > 0
     }
 
+    fn incr_counts(&self, is_collecting: bool, guard: &Guard) {
+        let collect_count = self.collect_count.get().wrapping_add(1);
+        self.collect_count.set(collect_count);
+
+        let advance_count = self.advance_count.get().wrapping_add(1);
+        self.advance_count.set(advance_count);
+
+        if advance_count % Self::COUNTS_BETWEEN_TRY_ADVANCE == 0 {
+            self.global().try_advance(&guard);
+        }
+        // After every `COUNTS_BETWEEN_COLLECT` try collecting some old garbage bags.
+        else if is_collecting || collect_count % Self::COUNTS_BETWEEN_COLLECT == 0 {
+            self.global().collect(&guard);
+        }
+    }
+
     /// Adds `deferred` to the thread-local bag.
     ///
     /// # Safety
@@ -325,6 +342,8 @@ impl Local {
             self.global().push_bag(bag, guard);
             deferred = d;
         }
+
+        self.incr_counts(false, guard);
     }
 
     pub fn flush(&self, guard: &Guard) {
@@ -334,7 +353,7 @@ impl Local {
             self.global().push_bag(bag, guard);
         }
 
-        self.global().collect(guard);
+        self.incr_counts(true, guard);
     }
 
     /// Pins the `Local`.
@@ -380,14 +399,9 @@ impl Local {
                 atomic::fence(Ordering::SeqCst);
             }
 
-            // Increment the pin counter.
-            let count = self.pin_count.get();
-            self.pin_count.set(count + Wrapping(1));
-
-            // After every `PINNINGS_BETWEEN_COLLECT` try advancing the epoch and collecting
-            // some garbage.
-            if count.0 % Self::PINNINGS_BETWEEN_COLLECT == 0 {
-                self.global().collect(&guard);
+            // Reset the advance couter if epoch has advanced.
+            if new_epoch != self.epoch.load(Ordering::Relaxed) {
+                self.advance_count.set(0);
             }
         }
 
