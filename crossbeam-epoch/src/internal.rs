@@ -264,6 +264,7 @@ pub struct Local {
     /// This is just an auxilliary counter that sometimes kicks off collection.
     collect_count: Cell<usize>,
     advance_count: Cell<usize>,
+    prev_epoch: Cell<Epoch>
 }
 
 impl Local {
@@ -287,6 +288,7 @@ impl Local {
                 handle_count: Cell::new(1),
                 collect_count: Cell::new(0),
                 advance_count: Cell::new(0),
+                prev_epoch: Cell::new(Epoch::starting()),
             })
             .into_shared(&unprotected());
             collector.global.locals.insert(local, &unprotected());
@@ -400,7 +402,8 @@ impl Local {
             }
 
             // Reset the advance couter if epoch has advanced.
-            if new_epoch != self.epoch.load(Ordering::Relaxed) {
+            if new_epoch != self.prev_epoch.get() {
+                self.prev_epoch.set(new_epoch);
                 self.advance_count.set(0);
             }
         }
