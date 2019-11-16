@@ -70,7 +70,7 @@ impl<T> Stack<T> {
             {
                 Ok(_) => unsafe {
                     let data = ManuallyDrop::into_inner(ptr::read(&(*head_ref).data));
-                    guard.defer_destroy(head);
+                    guard.defer_destroy_internal(head);
                     return Ok(Some(data));
                 }
                 Err(e) => head = e.current,

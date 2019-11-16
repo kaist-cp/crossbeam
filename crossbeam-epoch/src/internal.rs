@@ -523,7 +523,7 @@ impl Local {
     /// # Safety
     ///
     /// It should be safe for another thread to execute the given function.
-    pub unsafe fn defer(&self, mut garbage: Garbage, guard: &Guard) {
+    pub unsafe fn defer(&self, mut garbage: Garbage, guard: &Guard, internal: bool) {
         let bag = &mut *self.bag.get();
 
         while let Err(g) = bag.try_push(garbage) {
@@ -532,7 +532,9 @@ impl Local {
             garbage = g;
         }
 
-        self.incr_counts(false, guard);
+        if !internal {
+            self.incr_counts(false, guard);
+        }
     }
 
     pub fn flush(&self, guard: &Guard) {

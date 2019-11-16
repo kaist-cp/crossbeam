@@ -72,9 +72,9 @@ pub struct Guard {
 
 impl Guard {
     #[inline]
-    unsafe fn defer_garbage(&self, garbage: Garbage) {
+    unsafe fn defer_garbage(&self, garbage: Garbage, internal: bool) {
         if let Some(local) = self.local.as_ref() {
-            local.defer(garbage, self);
+            local.defer(garbage, self, internal);
         } else {
             garbage.dispose();
         }
@@ -202,9 +202,12 @@ impl Guard {
     where
         F: FnOnce() -> R,
     {
-        self.defer_garbage(Garbage::Deferred {
-            inner: Deferred::new(move || drop(f())),
-        });
+        self.defer_garbage(
+            Garbage::Deferred {
+                inner: Deferred::new(move || drop(f())),
+            },
+            false,
+        );
     }
 
     /// Stores a destructor for an object so that it can be deallocated and dropped at some point
@@ -277,15 +280,34 @@ impl Guard {
     /// ```
     ///
     /// [`unprotected`]: fn.unprotected.html
+    #[inline]
     pub unsafe fn defer_destroy<T>(&self, ptr: Shared<T>) {
         unsafe fn dtor<T>(data: usize) {
             drop(Shared::from(data as *const T).into_owned());
         }
 
-        self.defer_garbage(Garbage::Destroy {
-            data: ptr.as_raw() as usize,
-            dtor: dtor::<T>,
-        });
+        self.defer_garbage(
+            Garbage::Destroy {
+                data: ptr.as_raw() as usize,
+                dtor: dtor::<T>,
+            },
+            false,
+        );
+    }
+
+    #[inline]
+    pub(crate) unsafe fn defer_destroy_internal<T>(&self, ptr: Shared<T>) {
+        unsafe fn dtor<T>(data: usize) {
+            drop(Shared::from(data as *const T).into_owned());
+        }
+
+        self.defer_garbage(
+            Garbage::Destroy {
+                data: ptr.as_raw() as usize,
+                dtor: dtor::<T>,
+            },
+            true,
+        );
     }
 
     /// Clears up the thread-local cache of deferred functions by executing them or moving into the
