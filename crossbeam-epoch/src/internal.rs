@@ -141,7 +141,9 @@ impl Drop for Global {
     fn drop(&mut self) {
         unsafe {
             let status = self.status.load(Ordering::Relaxed, unprotected());
-            drop(status.into_owned());
+            if !status.is_null() {
+                drop(status.into_owned());
+            }
         }
     }
 }
