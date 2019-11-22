@@ -412,7 +412,7 @@ impl Local {
 
     /// Number of pinnings after which a participant will force to advance the global epoch.
     #[cfg(not(feature = "sanitize"))]
-    const COUNTS_BETWEEN_FORCE_ADVANCE: usize = 16 * 128;
+    const COUNTS_BETWEEN_FORCE_ADVANCE: usize = 4 * 128;
     #[cfg(feature = "sanitize")]
     const COUNTS_BETWEEN_FORCE_ADVANCE: usize = 8;
 
