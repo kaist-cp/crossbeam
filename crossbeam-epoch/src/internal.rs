@@ -110,12 +110,12 @@ impl StatusFlags {
 
     #[inline(always)]
     pub fn is_ejecting(self) -> bool {
-        !(self & Self::EJECTING).is_empty()
+        self.contains(Self::EJECTING)
     }
 
     #[inline(always)]
     pub fn is_pinned(self) -> bool {
-        !(self & Self::PINNED).is_empty()
+        self.contains(Self::PINNED)
     }
 
     #[inline(always)]
