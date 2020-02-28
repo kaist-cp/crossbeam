@@ -1,7 +1,7 @@
 use core::fmt;
 use core::mem;
 
-use atomic::Shared;
+use atomic::{decompose_data, Shared};
 use collector::Collector;
 use deferred::Deferred;
 use internal::Local;
@@ -191,10 +191,13 @@ impl Guard {
     where
         F: FnOnce() -> R,
     {
-        if let Some(local) = self.local.as_ref() {
+        let (raw, tag) = decompose_data::<Local>(self.local as usize);
+        if let Some(local) = raw.as_ref() {
             local.defer(Deferred::new(move || drop(f())), self);
         } else {
-            drop(f());
+            if tag == 0 {
+                drop(f());
+            }
         }
     }
 
@@ -526,4 +529,11 @@ pub unsafe fn unprotected() -> &'static Guard {
     // (consisting of a single pointer) have the same representation in memory.
     static UNPROTECTED: usize = 0;
     &*(&UNPROTECTED as *const _ as *const Guard)
+}
+
+/// doesn't drop at all
+#[inline]
+pub unsafe fn leaking() -> &'static Guard {
+    static LEAKING: usize = 1;
+    &*(&LEAKING as *const _ as *const Guard)
 }

@@ -96,7 +96,7 @@ cfg_if! {
 
         pub use self::atomic::{Atomic, CompareAndSetError, CompareAndSetOrdering, Owned, Pointer, Shared};
         pub use self::collector::{Collector, LocalHandle};
-        pub use self::guard::{unprotected, Guard};
+        pub use self::guard::{unprotected, Guard, leaking};
     }
 }
 

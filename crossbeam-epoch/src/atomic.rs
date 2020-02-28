@@ -109,7 +109,7 @@ fn data_with_tag<T>(data: usize, tag: usize) -> usize {
 
 /// Decomposes a tagged pointer `data` into the pointer and the tag.
 #[inline]
-fn decompose_data<T>(data: usize) -> (*mut T, usize) {
+pub(crate) fn decompose_data<T>(data: usize) -> (*mut T, usize) {
     let raw = (data & !low_bits::<T>()) as *mut T;
     let tag = data & low_bits::<T>();
     (raw, tag)
