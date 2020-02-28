@@ -290,7 +290,7 @@ impl Local {
                 advance_count: Cell::new(0),
                 prev_epoch: Cell::new(Epoch::starting()),
             })
-            .into_shared(&unprotected());
+            .into_shared(unprotected());
             collector.global.locals.insert(local, &unprotected());
             LocalHandle {
                 local: local.as_raw(),
