@@ -86,8 +86,6 @@ cfg_if! {
         #[macro_use]
         extern crate memoffset;
         #[macro_use]
-        extern crate scopeguard;
-        #[macro_use]
         extern crate static_assertions;
         extern crate murmur3;
         #[macro_use]

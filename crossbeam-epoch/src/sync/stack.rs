@@ -58,7 +58,7 @@ impl<T> Stack<T> {
 
         loop {
             let head = self.head.load(Acquire, guard);
-            head_shield.defend(head, guard)?;
+            head_shield.defend(head, Some(&self.head), guard)?;
 
             match unsafe { head_shield.as_ref() } {
                 Some(h) => {

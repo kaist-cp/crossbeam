@@ -3,7 +3,7 @@ use core::mem;
 use core::ptr;
 use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
-use atomic::{Owned, Pointer, Shared};
+use atomic::{Atomic, Owned, Pointer, Shared};
 use bloom_filter::BloomFilter;
 use guard::{unprotected, Guard};
 use internal::Local;
@@ -167,11 +167,7 @@ impl Drop for HazardSet {
             let guard = unprotected();
             let mut pred = Shield::null(guard);
             let mut curr = Shield::null(guard);
-            for node in self
-                .inner
-                .iter(&mut pred, &mut curr, true, guard)
-                .unwrap()
-            {
+            for node in self.inner.iter(&mut pred, &mut curr, true, guard).unwrap() {
                 let node = &*(node.unwrap());
                 node.entry.delete();
             }
@@ -182,17 +178,15 @@ impl Drop for HazardSet {
 impl HazardSet {
     /// Creates a new hazard set.
     pub fn new() -> Self {
-        Self {
-            inner: List::new(),
-        }
+        Self { inner: List::new() }
     }
 
     /// Creates an iterator over the hazard set.
     #[must_use]
     pub fn iter<'g>(
         &'g self,
-        pred: &'g mut Shield<HazardNode>,
-        curr: &'g mut Shield<HazardNode>,
+        pred: &'g mut Shield<Entry>,
+        curr: &'g mut Shield<Entry>,
         is_detaching: bool,
         guard: &'g Guard,
     ) -> Result<HazardSetIter<'g>, ShieldError> {
@@ -237,22 +231,30 @@ impl HazardSet {
     /// The caller should be the "owner" of this set.
     #[must_use]
     #[inline]
-    pub unsafe fn acquire(
-        &self,
-        data: usize,
-        guard: &Guard,
-    ) -> (*const HazardNode, usize) {
+    pub unsafe fn acquire(&self, data: usize, guard: &Guard) -> (*const HazardNode, usize) {
         repeat_iter(|| self.acquire_inner(data, guard)).unwrap()
     }
 
     /// Creates an approximate summary of the hazard set.
     #[inline]
-    pub fn make_summary(&self, is_curr_thread: bool, guard: &Guard) -> Result<Option<BloomFilter>, IterError> {
+    pub fn make_summary(
+        &self,
+        is_curr_thread: bool,
+        guard: &Guard,
+    ) -> Result<Option<BloomFilter>, IterError> {
         let mut visited = false;
         let mut filter = BloomFilter::new();
 
-        let mut pred = Shield::null(if is_curr_thread { unsafe { unprotected() } } else { guard });
-        let mut curr = Shield::null(if is_curr_thread { unsafe { unprotected() } } else { guard });
+        let mut pred = Shield::null(if is_curr_thread {
+            unsafe { unprotected() }
+        } else {
+            guard
+        });
+        let mut curr = Shield::null(if is_curr_thread {
+            unsafe { unprotected() }
+        } else {
+            guard
+        });
 
         for hazard in self
             .iter(&mut pred, &mut curr, is_curr_thread, guard)
@@ -296,7 +298,7 @@ impl<'g> Iterator for HazardSetIter<'g> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ShieldError {
     /// Defense fails because the thread is ejected.
-    Ejected,
+    Stale,
 }
 
 /// RAII type for hazard pointers to shared objects.
@@ -592,19 +594,31 @@ impl<T> Shield<T> {
     ///
     /// [`Shield`]: struct.Shield.html
     #[must_use]
-    pub fn defend<'g>(&mut self, ptr: Shared<'g, T>, guard: &'g Guard) -> Result<(), ShieldError> {
+    pub fn defend<'g>(
+        &mut self,
+        ptr: Shared<'g, T>,
+        loc: Option<&'g Atomic<T>>,
+        guard: &'g Guard,
+    ) -> Result<(), ShieldError> {
         let data = ptr.into_usize();
         self.data = data;
         unsafe {
             if let Some(node) = self.node.as_ref() {
                 node.update(self.index, data_with_tag::<T>(data, 0), Ordering::Relaxed);
 
-                if let Some(local) = self.local.as_ref() {
-                    // Ensures `local` is not ejected.
-                    if let Err(e) = local.get_epoch(guard) {
+                if self.local.is_null() {
+                    return Ok(());
+                }
+
+                if let Some(loc) = loc {
+                    // Synchronizes with collect().
+                    membarrier::light_membarrier();
+
+                    // Ensures `loc` still contains `ptr`.
+                    if loc.load(Ordering::Relaxed, guard) != ptr {
                         self.data = 0;
                         node.update(self.index, 0, Ordering::Release);
-                        return Err(e);
+                        return Err(ShieldError::Stale);
                     }
                 }
             }

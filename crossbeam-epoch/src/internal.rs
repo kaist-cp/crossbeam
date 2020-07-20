@@ -40,9 +40,8 @@ use core::cmp;
 use core::convert::TryInto;
 use core::mem::{self, ManuallyDrop};
 use core::num::Wrapping;
-use core::ops::Deref;
 use core::ptr;
-use core::sync::atomic::{self, Ordering};
+use core::sync::atomic::Ordering;
 
 use crossbeam_utils::CachePadded;
 use membarrier;
@@ -53,7 +52,7 @@ use collector::{Collector, LocalHandle};
 use garbage::{Bag, Garbage};
 use guard::{unprotected, Guard};
 use hazard::{HazardSet, Shield, ShieldError};
-use sync::list::{repeat_iter, Entry, IsElement, IterError, List};
+use sync::list::{repeat_iter, Entry, IsElement, List};
 use sync::stack::Stack;
 use tag::*;
 
@@ -110,11 +109,6 @@ impl StatusFlags {
     }
 
     #[inline(always)]
-    pub fn is_ejecting(self) -> bool {
-        !(self & Self::EJECTING).is_empty()
-    }
-
-    #[inline(always)]
     pub fn is_pinned(self) -> bool {
         !(self & Self::PINNED).is_empty()
     }
@@ -131,20 +125,7 @@ pub struct Global {
     locals: List<Local>,
 
     /// The global pool of bags of deferred functions.
-    bags: [CachePadded<Stack<Bag>>; 1 << BAGS_WIDTH],
-
-    /// The global status consisting of (1) the (approximate) summary of hazard pointers, and (2)
-    /// the epoch.
-    pub(crate) status: Atomic<CachePadded<BloomFilter>>,
-}
-
-impl Drop for Global {
-    fn drop(&mut self) {
-        unsafe {
-            let status = self.status.load(Ordering::Relaxed, unprotected());
-            drop(status.into_owned());
-        }
-    }
+    bags: CachePadded<Stack<Bag>>,
 }
 
 impl Global {
@@ -159,67 +140,23 @@ impl Global {
 
         Self {
             locals: List::new(),
-            bags: [
-                CachePadded::new(Stack::new()),
-                CachePadded::new(Stack::new()),
-                CachePadded::new(Stack::new()),
-                CachePadded::new(Stack::new()),
-                CachePadded::new(Stack::new()),
-                CachePadded::new(Stack::new()),
-                CachePadded::new(Stack::new()),
-                CachePadded::new(Stack::new()),
-            ],
-            status: Atomic::null(),
+            bags: CachePadded::new(Stack::new()),
         }
     }
 
     /// Pushes the bag into the global queue and replaces the bag with a new empty bag.
-    pub fn push_bag(&self, bag: &mut Bag, index: usize) {
-        let bags = unsafe { &*self.bags.get_unchecked(index % (1 << BAGS_WIDTH)) };
+    pub fn push_bag(&self, bag: &mut Bag) {
         let bag = mem::replace(bag, Bag::new());
-        bags.push(bag);
+        self.bags.push(bag);
     }
 
-    #[inline]
-    #[must_use]
-    pub fn collect_inner<'g>(
-        &'g self,
-        status: Shared<'g, CachePadded<BloomFilter>>,
-        guard: &'g Guard,
-    ) -> Result<bool, ShieldError> {
-        let shield = Shield::new(status, guard);
-        let summary = unsafe { shield.as_ref() }.map(Deref::deref);
-
-        let flags = StatusFlags::from_bits_truncate(status.tag());
-        let index = flags.epoch().wrapping_sub(3);
-        let bags = unsafe { &*self.bags.get_unchecked(index % (1 << BAGS_WIDTH)) };
-        let steps = if cfg!(feature = "sanitize") {
-            usize::max_value()
-        } else {
-            Self::COLLECT_STEPS
-        };
-
-        for _ in 0..steps {
-            if let Some(mut bag) = bags.try_pop(guard)? {
-                // Disposes the garbages (except for hazard pointers) in the bag popped from the
-                // global queue.
-                let disposed = bag.dispose(summary);
-
-                if let Some(local) = unsafe { guard.local.as_ref() } {
-                    local.inc_reclaimed(disposed);
-                }
-
-                // If the bag is not empty (due to hazard pointers), push it back to the global
-                // queue.
-                if !bag.is_empty() {
-                    self.push_bag(&mut bag, index.wrapping_add(1));
-                }
-            } else {
-                return Ok(true);
-            }
+    pub fn collect_hazards(&self, guard: &Guard) -> Option<BloomFilter> {
+        // Heavy fence to synchronize with `Shield::defend()`.
+        unsafe {
+            membarrier::heavy_membarrier();
         }
 
-        Ok(false)
+        todo!()
     }
 
     /// Collects several bags from the global queue and executes deferred functions in them.
@@ -231,139 +168,39 @@ impl Global {
     /// `collect()` is not called.
     #[cold]
     #[must_use]
-    pub fn collect(&self, guard: &Guard) -> Result<(), ShieldError> {
-        let global_status = self.status.load(Ordering::Acquire, guard);
-        let global_flags = StatusFlags::from_bits_truncate(global_status.tag());
-        if self.collect_inner(global_status, guard)? {
-            self.advance(global_flags.epoch(), false, guard)?;
-        }
-        Ok(())
-    }
+    pub fn collect<'g>(&'g self, guard: &'g Guard) -> Result<bool, ShieldError> {
+        let summary = self.collect_hazards(guard);
 
-    /// Attempts to advance the global epoch.
-    ///
-    /// The global epoch can advance only if all currently pinned participants have been pinned in
-    /// the current epoch.
-    ///
-    /// Returns whether the global epoch has advanced.
-    ///
-    /// `advance()` is annotated `#[cold]` because it is rarely called.
-    #[cold]
-    #[must_use]
-    pub fn advance(
-        &self,
-        epoch: usize,
-        is_forcing: bool,
-        guard: &Guard,
-    ) -> Result<(), ShieldError> {
-        let global_status = self.status.load(Ordering::Relaxed, guard);
-        let global_flags = StatusFlags::from_bits_truncate(global_status.tag());
+        let steps = if cfg!(feature = "sanitize") {
+            usize::max_value()
+        } else {
+            Self::COLLECT_STEPS
+        };
 
-        if epoch != global_flags.epoch() {
-            return Ok(());
-        }
+        for _ in 0..steps {
+            if let Some(mut bag) = self.bags.try_pop(guard)? {
+                // Disposes the garbages (except for hazard pointers) in the bag popped from the
+                // global queue.
+                let disposed = bag.dispose(summary.as_ref());
 
-        atomic::fence(Ordering::SeqCst);
-
-        let mut new_summary = BloomFilter::new();
-        {
-            let mut local_summary = Shield::null(guard);
-            let mut pred = Shield::null(guard);
-            let mut curr = Shield::null(guard);
-
-            // TODO(stjepang): `Local`s are stored in a linked list because linked lists are fairly easy
-            // to implement in a lock-free manner. However, traversal can be slow due to cache misses
-            // and data dependencies. We should experiment with other data structures as well.
-            for local in self.locals.iter(&mut pred, &mut curr, true, guard)? {
-                match local {
-                    Err(IterError::Stalled) => {
-                        // A concurrent thread stalled this iteration. That thread might also try to
-                        // advance the epoch, in which case we leave the job to it. Otherwise, the
-                        // epoch will not be advanced.
-                        return Ok(());
-                    }
-                    Err(IterError::ShieldError(e)) => {
-                        return Err(e);
-                    }
-                    Ok(local) => {
-                        let local = unsafe { &*local };
-
-                        let mut local_status = local.status.load(Ordering::Acquire, guard);
-                        loop {
-                            let local_flags = StatusFlags::from_bits_truncate(local_status.tag());
-
-                            // If `local` is not pinned, we're okay.
-                            if !local_flags.is_pinned() {
-                                break;
-                            }
-
-                            // Compares the local epoch with the target epoch.
-                            match epoch_cmp(local_flags.epoch(), epoch) {
-                                // If they're the same, we're okay.
-                                cmp::Ordering::Equal => break,
-                                // If the local epoch is greater, we cannot advance.
-                                cmp::Ordering::Greater => return Ok(()),
-                                cmp::Ordering::Less => (),
-                            }
-                            // Now we know local epoch < target epoch.
-
-                            // If it's not forcing to advance, bail out.
-                            if !is_forcing {
-                                return Ok(());
-                            }
-
-                            // Ejects `local` and retries.
-                            local_status = local.eject(local_status, epoch, guard)?;
-                        }
-
-                        // Reads the local summary and add it to the new summary.
-                        if !local_status.is_null() {
-                            local_summary.defend(local_status, guard)?;
-                            new_summary.union(unsafe { local_summary.deref() });
-                        }
-                    }
+                if let Some(local) = unsafe { guard.local.as_ref() } {
+                    local.inc_reclaimed(disposed);
                 }
+
+                // TODO(@jeehoonkang): it must be a queue...  otherwise a garbage will be inspected
+                // on and on and on.
+                //
+                // If the bag is not empty (due to hazard pointers), push it back to the global
+                // queue.
+                if !bag.is_empty() {
+                    self.push_bag(&mut bag);
+                }
+            } else {
+                return Ok(true);
             }
         }
 
-        // If the global epoch already has advanced, we cannot advance it again.
-        let global_status_validation = self.status.load(Ordering::Relaxed, guard);
-        if global_status != global_status_validation {
-            return Ok(());
-        }
-
-        // Collects all the old garbage bags.
-        while !self.collect_inner(global_status, guard)? {}
-
-        // All pinned participants were pinned in the current global epoch, and we have removed all
-        // the old garbages. Now let's advance the global epoch. First, calculates the new global
-        // status.
-        let new_flags = StatusFlags::new(false, false, global_flags.epoch().wrapping_add(1));
-        let new_status = Owned::new(CachePadded::new(new_summary))
-            .into_shared(guard)
-            .with_tag(new_flags.bits());
-
-        // Protects the old global summary so that it cannot be reused.
-        let _shield = Shield::new(global_status, guard);
-
-        // Tries to replace the global status.
-        match self
-            .status
-            .compare_and_set(global_status, new_status, Ordering::Release, guard)
-        {
-            // If successful, destroys the old summary.
-            Ok(_) => unsafe {
-                if !global_status.is_null() {
-                    guard.defer_destroy(global_status);
-                }
-            },
-            // If unsuccessful, destroys the new summary.
-            Err(_) => unsafe {
-                drop(new_status.into_owned());
-            },
-        };
-
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -382,8 +219,8 @@ pub struct Local {
     /// When all guards and handles get dropped, this reference is destroyed.
     collector: UnsafeCell<ManuallyDrop<Collector>>,
 
-    /// The local bag of deferred functions.
-    pub(crate) bag: UnsafeCell<Bag>,
+    /// The local garbages of deferred functions.
+    garbages: UnsafeCell<Vec<Garbage>>,
 
     /// The number of guards keeping this participant pinned.
     guard_count: Cell<usize>,
@@ -414,11 +251,8 @@ impl Local {
     /// global queue.
     const PINNINGS_BETWEEN_COLLECT: usize = 8;
 
-    /// Number of pinnings after which a participant will try to advance the global epoch.
-    const PINNINGS_BETWEEN_TRY_ADVANCE: usize = 256;
-
-    /// Number of pinnings after which a participant will is_forcing to advance the global epoch.
-    const PINNINGS_BETWEEN_FORCE_ADVANCE: usize = 128 * 256;
+    /// Maximum number of unreclaimed garbages.
+    const MAX_GARBAGES: usize = 256;
 
     /// Registers a new `Local` in the provided `Global`.
     pub fn register(collector: &Collector) -> LocalHandle {
@@ -430,7 +264,7 @@ impl Local {
                 status: CachePadded::new(Atomic::null()),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
                 hazards: HazardSet::new(),
-                bag: UnsafeCell::new(Bag::new()),
+                garbages: UnsafeCell::new(Vec::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
                 pin_count: Cell::new(Wrapping(0)),
@@ -479,64 +313,50 @@ impl Local {
         self.guard_count.get() > 0
     }
 
-    /// Returns the current epoch if `self` is not ejected yet.
-    #[must_use]
-    #[inline(always)]
-    pub fn get_epoch(&self, guard: &Guard) -> Result<usize, ShieldError> {
-        // Light fence to synchronize with `Self::eject()`.
-        membarrier::light_membarrier();
-
-        let local_status = self.status.load(Ordering::Relaxed, guard);
-        // let local_flags = StatusFlags::from_bits_truncate(local_status.tag());
-
-        // if local_flags.is_pinned() && !local_flags.is_ejecting() {
-        //     Ok(local_flags.epoch())
-
-        // HACK(@jeehoonkang): It is inside a very hot loop, but LLVM cannot optimize the above
-        // lines...
-        let tag = local_status.tag();
-        if tag & StatusFlags::PINNED.bits() != 0 &&
-            tag & StatusFlags::EJECTING.bits() == 0
-        {
-            Ok(tag & StatusFlags::EPOCH.bits())
-        } else {
-            Err(ShieldError::Ejected)
-        }
-    }
-
-    fn get_epoch_resilient(&self, guard: &Guard) -> usize {
-        self.get_epoch(guard).unwrap_or_else(|_| {
-            atomic::fence(Ordering::SeqCst);
-            let global_status = self
-                .global()
-                .status
-                .load(Ordering::Acquire, unsafe { unprotected() });
-            let global_flags = StatusFlags::from_bits_truncate(global_status.tag());
-            global_flags.epoch()
-        })
-    }
-
     /// Adds `deferred` to the thread-local bag.
     ///
     /// # Safety
     ///
     /// It should be safe for another thread to execute the given function.
-    pub unsafe fn defer(&self, mut garbage: Garbage, guard: &Guard) {
-        let bag = &mut *self.bag.get();
+    pub unsafe fn defer(&self, garbage: Garbage, guard: &Guard) {
+        let garbages = &mut *self.garbages.get();
+        garbages.push(garbage);
 
-        while let Err(g) = bag.try_push(garbage) {
-            let epoch = self.get_epoch_resilient(guard);
-            self.global().push_bag(bag, epoch);
-            garbage = g;
+        if garbages.len() > Self::MAX_GARBAGES {
+            self.collect(guard);
         }
     }
 
-    pub fn flush(&self, guard: &Guard) {
-        let epoch = self.get_epoch_resilient(guard);
+    pub fn collect(&self, guard: &Guard) {
+        let hazards = self.global().collect_hazards(guard);
 
-        let bag = unsafe { &mut *self.bag.get() };
-        if !bag.is_empty() {
-            self.global().push_bag(bag, epoch);
+        let garbages = unsafe { &mut *self.garbages.get() };
+        *garbages = garbages
+            .drain(..)
+            .filter_map(|g| {
+                if g.is_hazardous(hazards.as_ref()) {
+                    Some(g)
+                } else {
+                    g.dispose();
+                    None
+                }
+            })
+            .collect();
+    }
+
+    pub fn flush(&self, guard: &Guard) {
+        let garbages = unsafe { &mut *self.garbages.get() };
+        let mut bag = Bag::new();
+
+        for mut garbage in garbages.drain(..) {
+            while let Err(g) = unsafe { bag.try_push(garbage) } {
+                self.global().push_bag(&mut bag);
+                garbage = g;
+            }
+
+            if !bag.is_empty() {
+                self.global().push_bag(&mut bag);
+            }
         }
 
         let _ = self.global().collect(guard);
@@ -560,72 +380,13 @@ impl Local {
                 "[Local::pin()] `self` should be unpinned"
             );
 
-            // Loads the current global status. It's safe not to protect the load because we're not
-            // accessing its contents.
-            let mut global_status =
-                unsafe { self.global().status.load(Ordering::Relaxed, unprotected()) };
-
-            loop {
-                let global_flags = StatusFlags::from_bits_truncate(global_status.tag());
-
-                // Stores the local status as pinned at the epoch.
-                let new_status = local_status
-                    .with_tag(StatusFlags::new(false, true, global_flags.epoch()).bits());
-
-                // Now we must store the new status into `self.status` and execute a `SeqCst` fence.
-                // The fence makes sure that any future loads from `Atomic`s will not happen before
-                // this store.
-                if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
-                    // HACK(stjepang): On x86 architectures there are two different ways of
-                    // executing a `SeqCst` fence.
-                    //
-                    // 1. `atomic::fence(SeqCst)`, which compiles into a `mfence` instruction.
-                    // 2. `_.compare_and_swap(_, _, SeqCst)`, which compiles into a `lock cmpxchg`
-                    //    instruction.
-                    //
-                    // Both instructions have the effect of a full barrier, but benchmarks have
-                    // shown that the second one makes pinning faster in this particular case.  It
-                    // is not clear that this is permitted by the C++ memory model (SC fences work
-                    // very differently from SC accesses), but experimental evidence suggests that
-                    // this works fine.  Using inline assembly would be a viable (and correct)
-                    // alternative, but alas, that is not possible on stable Rust.
-                    self.status.swap(new_status, Ordering::SeqCst, &guard);
-
-                    // We add a compiler fence to make it less likely for LLVM to do something wrong
-                    // here.  Formally, this is not enough to get rid of data races; practically, it
-                    // should go a long way.
-                    atomic::compiler_fence(Ordering::SeqCst);
-                } else {
-                    self.status.store(new_status, Ordering::Relaxed);
-                    atomic::fence(Ordering::SeqCst);
-                }
-
-                // Validates that the global status did not change.
-                let global_status_validation =
-                    unsafe { self.global().status.load(Ordering::Relaxed, unprotected()) };
-                if global_status == global_status_validation {
-                    break;
-                }
-
-                // Retries with a more recent value of global status.
-                global_status = global_status_validation;
-            }
-
             // Increment the pin counter.
             let pin_count = self.pin_count.get();
             self.pin_count.set(pin_count + Wrapping(1));
 
-            // After every `PINNINGS_BETWEEN_COLLECT` try advancing the global epoch.
-            if pin_count.0 % Self::PINNINGS_BETWEEN_TRY_ADVANCE == 0 {
-                let global_flags = StatusFlags::from_bits_truncate(global_status.tag());
-                let is_forcing = pin_count.0 % Self::PINNINGS_BETWEEN_FORCE_ADVANCE == 0;
-                let _ = self
-                    .global()
-                    .advance(global_flags.epoch(), is_forcing, &guard);
-            }
             // After every `PINNINGS_BETWEEN_COLLECT` try collecting some old garbage bags.
-            else if pin_count.0 % Self::PINNINGS_BETWEEN_COLLECT == 0 {
-                let _ = self.global().collect_inner(global_status, &guard);
+            if pin_count.0 % Self::PINNINGS_BETWEEN_COLLECT == 0 {
+                let _ = self.global().collect(&guard);
             }
         }
 
@@ -678,14 +439,6 @@ impl Local {
         }
     }
 
-    /// Unpins and then pins the `Local`.
-    #[inline]
-    pub fn repin(&self) {
-        // TODO(@jeehoonkang): optimize it.
-        self.unpin();
-        mem::forget(self.pin());
-    }
-
     /// Increments the handle count.
     #[inline]
     pub fn acquire_handle(&self) {
@@ -704,96 +457,6 @@ impl Local {
         if guard_count == 0 && handle_count == 1 {
             self.finalize();
         }
-    }
-
-    /// Ejects `self` from the current epoch, and returns its new status.
-    #[must_use]
-    fn eject<'g>(
-        &self,
-        mut status: Shared<'g, CachePadded<BloomFilter>>,
-        target_epoch: usize,
-        guard: &'g Guard,
-    ) -> Result<Shared<'g, CachePadded<BloomFilter>>, ShieldError> {
-        // Marks `self` as ejected.
-        loop {
-            let flags = StatusFlags::from_bits_truncate(status.tag());
-            let epoch = flags.epoch();
-
-            // If `self` is not pinned at an epoch less than the target epoch, we're done.
-            if !(flags.is_pinned() && epoch_cmp(epoch, target_epoch) == cmp::Ordering::Less) {
-                return Ok(status);
-            }
-
-            // If it's marked as being ejected, proceeds to the next stage.
-            if flags.is_ejecting() {
-                break;
-            }
-
-            // Tries to mark the status as being ejected.
-            let new_status = status.with_tag((flags | StatusFlags::EJECTING).bits());
-            match self
-                .status
-                .compare_and_set(status, new_status, Ordering::AcqRel, guard)
-            {
-                // If successful, proceeds to the next stage.
-                Ok(_) => {
-                    status = new_status;
-                    break;
-                }
-                // If not, retries.
-                Err(e) => status = e.current,
-            }
-        }
-
-        // Heavy fence to synchronize with `Self::get_epoch()`.
-        unsafe { membarrier::heavy_membarrier(); }
-
-        // Now `self` is pinned at an epoch less than `target_epoch`, and it's marked as being
-        // ejected. Finishes ejecting `self`.
-        self.help_eject(status, guard)
-    }
-
-    /// Helps finishing the ejection of `self`, and returns its new status.
-    #[must_use]
-    fn help_eject<'g>(
-        &self,
-        status: Shared<'g, CachePadded<BloomFilter>>,
-        guard: &'g Guard,
-    ) -> Result<Shared<'g, CachePadded<BloomFilter>>, ShieldError> {
-        let flags = StatusFlags::from_bits_truncate(status.tag());
-        debug_assert!(
-            flags.is_pinned(),
-            "[Local::help_eject()] `self` should be pinned"
-        );
-
-        // Shields the current status to prevent the ABA problem.
-        let _shield = Shield::new(status, guard);
-
-        // Creates a summary of the set of hazard pointers.
-        let new_status = repeat_iter(|| self.hazards.make_summary(false, &guard))?
-            .map(|summary| Owned::new(CachePadded::new(summary)).into_shared(&guard))
-            .unwrap_or_else(|| Shared::null())
-            .with_tag(StatusFlags::new(true, false, flags.epoch()).bits());
-
-        // Replaces the old status with the new one.
-        let status = match self
-            .status
-            .compare_and_set(status, new_status, Ordering::AcqRel, guard)
-        {
-            Ok(_) => unsafe {
-                if !status.is_null() {
-                    guard.defer_destroy(status);
-                }
-                new_status
-            },
-            Err(e) => unsafe {
-                if !e.new.is_null() {
-                    drop(e.new.into_owned());
-                }
-                e.current
-            },
-        };
-        Ok(status)
     }
 
     /// Removes the `Local` from the global linked list.

@@ -92,14 +92,6 @@ pub trait IsElement<T> {
     unsafe fn finalize(&Entry, &Guard);
 }
 
-unsafe fn entry_of_shared<'g, T, C: IsElement<T>>(element: Shared<'g, T>) -> Shared<'g, Entry> {
-    Shared::from(C::entry_of(&*element.as_raw()) as *const _).with_tag(element.tag())
-}
-
-unsafe fn element_of_shared<'g, T, C: IsElement<T>>(entry: Shared<'g, Entry>) -> Shared<'g, T> {
-    Shared::from(C::element_of(&*entry.as_raw()) as *const _).with_tag(entry.tag())
-}
-
 /// A lock-free, intrusive linked list of type `T`.
 #[derive(Debug)]
 pub struct List<T, C: IsElement<T> = T> {
@@ -117,10 +109,10 @@ pub struct Iter<'g, T: 'g, C: IsElement<T>> {
     guard: &'g Guard,
 
     /// Pointer from the predecessor to the current entry.
-    pred: &'g mut Shield<T>,
+    pred: &'g mut Shield<Entry>,
 
     /// The current entry.
-    curr: &'g mut Shield<T>,
+    curr: &'g mut Shield<Entry>,
 
     /// Whether to detach and `defer_destroy` those nodes marked as deleted.
     is_detaching: bool,
@@ -176,16 +168,13 @@ impl Entry {
     #[inline]
     pub unsafe fn iter<'g, T, C: IsElement<T>>(
         &'g self,
-        pred: &'g mut Shield<T>,
-        curr: &'g mut Shield<T>,
+        pred: &'g mut Shield<Entry>,
+        curr: &'g mut Shield<Entry>,
         is_detaching: bool,
         guard: &'g Guard,
     ) -> Result<Iter<'g, T, C>, ShieldError> {
-        pred.defend(Shared::from(C::element_of(self) as *const _), guard)?;
-        curr.defend(
-            element_of_shared::<T, C>(self.next.load(Acquire, guard)),
-            guard,
-        )?;
+        pred.defend(Shared::from(self as *const _), None, guard)?;
+        curr.defend(self.next.load(Acquire, guard), Some(&self.next), guard)?;
 
         Ok(Iter {
             guard,
@@ -259,8 +248,8 @@ impl<T, C: IsElement<T>> List<T, C> {
     #[must_use]
     pub fn iter<'g>(
         &'g self,
-        pred: &'g mut Shield<T>,
-        curr: &'g mut Shield<T>,
+        pred: &'g mut Shield<Entry>,
+        curr: &'g mut Shield<Entry>,
         is_detaching: bool,
         guard: &'g Guard,
     ) -> Result<Iter<'g, T, C>, ShieldError> {
@@ -297,8 +286,8 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
             return Some(Err(IterError::Stalled));
         }
 
-        while let Some(succ) = unsafe { self.curr.as_ref() }
-            .map(|curr| C::entry_of(curr).next.load(Acquire, self.guard))
+        while let Some(succ) =
+            unsafe { self.curr.as_ref() }.map(|curr| curr.next.load(Acquire, self.guard))
         {
             if succ.tag() & 1 != 0 {
                 let succ = succ.with_tag(0);
@@ -313,9 +302,9 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
                     }
 
                     mem::swap(&mut self.pred, &mut self.curr);
-                    if let Err(e) = self
-                        .curr
-                        .defend(unsafe { element_of_shared::<T, C>(succ) }, self.guard)
+                    if let Err(e) =
+                        self.curr
+                            .defend(succ, Some(&unsafe { self.pred.deref() }.next), self.guard)
                     {
                         return Some(Err(IterError::ShieldError(e)));
                     }
@@ -329,30 +318,29 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
                 // node leaves the list in an invalid state.
                 debug_assert_eq!(self.curr.tag(), 0);
 
-                match &C::entry_of(unsafe { self.pred.deref() })
-                    .next
-                    .compare_and_set(
-                        unsafe { entry_of_shared::<T, C>(self.curr.shared()) },
-                        succ,
-                        AcqRel,
-                        self.guard,
-                    ) {
+                match &unsafe { self.pred.deref() }.next.compare_and_set(
+                    self.curr.shared(),
+                    succ,
+                    AcqRel,
+                    self.guard,
+                ) {
                     Ok(_) => {
                         // We succeeded in unlinking this element from the list, so we have to
                         // schedule deallocation. Deferred drop is okay, because `list.delete()` can
                         // only be called if `T: 'static`.
                         unsafe {
-                            C::finalize(C::entry_of(&*self.curr.as_raw()), self.guard);
+                            C::finalize(&*self.curr.as_raw(), self.guard);
                         }
 
                         // Move over the removed by only advancing `curr`, not `pred`.
                         if succ.is_null() {
                             self.curr.release();
                         } else {
-                            if let Err(e) = self
-                                .curr
-                                .defend(unsafe { element_of_shared::<T, C>(succ) }, self.guard)
-                            {
+                            if let Err(e) = self.curr.defend(
+                                succ,
+                                Some(&unsafe { self.pred.deref() }.next),
+                                self.guard,
+                            ) {
                                 return Some(Err(IterError::ShieldError(e)));
                             }
                         }
@@ -365,7 +353,8 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
                                 self.curr.release();
                             } else {
                                 if let Err(e) = self.curr.defend(
-                                    unsafe { element_of_shared::<T, C>(e.current) },
+                                    e.current,
+                                    Some(&unsafe { self.pred.deref() }.next),
                                     self.guard,
                                 ) {
                                     return Some(Err(IterError::ShieldError(e)));
@@ -387,15 +376,15 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
             if succ.is_null() {
                 self.curr.release();
             } else {
-                if let Err(e) = self
-                    .curr
-                    .defend(unsafe { element_of_shared::<T, C>(succ) }, self.guard)
+                if let Err(e) =
+                    self.curr
+                        .defend(succ, Some(&unsafe { self.pred.deref() }.next), self.guard)
                 {
                     return Some(Err(IterError::ShieldError(e)));
                 }
             }
 
-            return Some(Ok(unsafe { self.pred.deref() }));
+            return Some(Ok(unsafe { C::element_of(self.pred.deref()) }));
         }
 
         // We reached the end of the list.
