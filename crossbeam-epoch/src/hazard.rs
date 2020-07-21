@@ -580,7 +580,7 @@ impl<T> Shield<T> {
     /// let mut shield = Shield::null(&guard);
     ///
     /// // Defend the heap-allocated object.
-    /// shield.defend(a.load(SeqCst, &guard), &guard);
+    /// shield.defend(a.load(SeqCst, &guard), Some(&a), &guard);
     ///
     /// // Drop the guard.
     /// drop(guard);

@@ -145,10 +145,13 @@ impl<T> Queue<T> {
             .compare_and_set(head, next, Release, guard)
             .is_ok()
         {
+            let data = unsafe {
+                ptr::read(&shield2.deref().data)
+            };
             unsafe {
                 guard.defer_destroy(head);
-                return Ok(Ok(Some(ManuallyDrop::into_inner(ptr::read(&shield2.deref().data)))));
             }
+            return Ok(Ok(Some(ManuallyDrop::into_inner(data))));
         }
 
         Ok(Err(()))
