@@ -128,21 +128,30 @@ impl<T> Queue<T> {
 
         // Access the next node to the head.
         let next = unsafe { shield1.deref() }.next.load(Acquire, guard);
-
+        if next.is_null() {
+            return Ok(Ok(None));
+        }
         shield2.defend(next, Some(&unsafe { shield1.deref() }.next), guard)?;
 
-        Ok(match unsafe { shield2.as_ref() } {
-            Some(n) => unsafe {
-                self.head
-                    .compare_and_set(head, next, Release, guard)
-                    .map(|_| {
-                        guard.defer_destroy(head);
-                        Some(ManuallyDrop::into_inner(ptr::read(&n.data)))
-                    })
-                    .map_err(|_| ())
-            },
-            None => Ok(None),
-        })
+        let tail = self.tail.load(Relaxed, guard);
+        if head == tail {
+            let _ = self
+                .tail
+                .compare_and_set(tail, next, Release, guard);
+        }
+
+        if self
+            .head
+            .compare_and_set(head, next, Release, guard)
+            .is_ok()
+        {
+            unsafe {
+                guard.defer_destroy(head);
+                return Ok(Ok(Some(ManuallyDrop::into_inner(ptr::read(&shield2.deref().data)))));
+            }
+        }
+
+        Ok(Err(()))
     }
 
     /// Attempts to dequeue from the front.

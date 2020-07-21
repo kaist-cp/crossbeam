@@ -185,8 +185,8 @@ impl HazardSet {
     #[must_use]
     pub fn iter<'g>(
         &'g self,
-        pred: &'g mut Shield<Entry>,
-        curr: &'g mut Shield<Entry>,
+        pred: &'g mut Shield<HazardNode>,
+        curr: &'g mut Shield<HazardNode>,
         is_detaching: bool,
         guard: &'g Guard,
     ) -> Result<HazardSetIter<'g>, ShieldError> {
@@ -594,12 +594,28 @@ impl<T> Shield<T> {
     ///
     /// [`Shield`]: struct.Shield.html
     #[must_use]
+    #[inline]
     pub fn defend<'g>(
         &mut self,
         ptr: Shared<'g, T>,
         loc: Option<&'g Atomic<T>>,
         guard: &'g Guard,
     ) -> Result<(), ShieldError> {
+        self.defend_derived(ptr, loc, |p| p, guard)
+    }
+
+    // More general version of defend.
+    #[must_use]
+    pub fn defend_derived<'g, U, C>(
+        &mut self,
+        ptr: Shared<'g, T>,
+        loc: Option<&'g Atomic<U>>,
+        convert: C,
+        guard: &'g Guard,
+    ) -> Result<(), ShieldError>
+    where
+        C: FnOnce(Shared<U>) -> Shared<T>
+    {
         let data = ptr.into_usize();
         self.data = data;
         unsafe {
@@ -615,7 +631,7 @@ impl<T> Shield<T> {
                     membarrier::light_membarrier();
 
                     // Ensures `loc` still contains `ptr`.
-                    if loc.load(Ordering::Relaxed, guard) != ptr {
+                    if convert(loc.load(Ordering::Relaxed, guard)) != ptr {
                         self.data = 0;
                         node.update(self.index, 0, Ordering::Release);
                         return Err(ShieldError::Stale);
@@ -625,6 +641,12 @@ impl<T> Shield<T> {
         }
 
         Ok(())
+    }
+
+    #[inline]
+    /// TODO(@jeehoonkang): documentation...
+    pub unsafe fn defend_fake<'g>(&mut self, ptr: Shared<'g, T>) {
+        self.data = ptr.into_usize();
     }
 
     /// Releases the inner hazard pointer.

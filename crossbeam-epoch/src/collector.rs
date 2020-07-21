@@ -192,7 +192,7 @@ mod tests {
             guard.flush();
         }
 
-        let mut last = 0;
+        let mut last = DESTROYS.load(Ordering::Relaxed);
 
         while last < COUNT {
             let curr = DESTROYS.load(Ordering::Relaxed);

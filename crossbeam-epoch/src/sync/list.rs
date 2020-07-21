@@ -92,6 +92,14 @@ pub trait IsElement<T> {
     unsafe fn finalize(&Entry, &Guard);
 }
 
+unsafe fn entry_of_shared<'g, T, C: IsElement<T>>(element: Shared<'g, T>) -> Shared<'g, Entry> {
+    Shared::from(C::entry_of(&*element.as_raw()) as *const _).with_tag(element.tag())
+}
+
+unsafe fn element_of_shared<'g, T, C: IsElement<T>>(entry: Shared<'g, Entry>) -> Shared<'g, T> {
+    Shared::from(C::element_of(&*entry.as_raw()) as *const _).with_tag(entry.tag())
+}
+
 /// A lock-free, intrusive linked list of type `T`.
 #[derive(Debug)]
 pub struct List<T, C: IsElement<T> = T> {
@@ -109,10 +117,12 @@ pub struct Iter<'g, T: 'g, C: IsElement<T>> {
     guard: &'g Guard,
 
     /// Pointer from the predecessor to the current entry.
-    pred: &'g mut Shield<Entry>,
+    pred: &'g mut Shield<T>,
 
     /// The current entry.
-    curr: &'g mut Shield<Entry>,
+    curr: &'g mut Shield<T>,
+
+    succ: Shared<'g, Entry>,
 
     /// Whether to detach and `defer_destroy` those nodes marked as deleted.
     is_detaching: bool,
@@ -168,18 +178,18 @@ impl Entry {
     #[inline]
     pub unsafe fn iter<'g, T, C: IsElement<T>>(
         &'g self,
-        pred: &'g mut Shield<Entry>,
-        curr: &'g mut Shield<Entry>,
+        pred: &'g mut Shield<T>,
+        curr: &'g mut Shield<T>,
         is_detaching: bool,
         guard: &'g Guard,
     ) -> Result<Iter<'g, T, C>, ShieldError> {
-        pred.defend(Shared::from(self as *const _), None, guard)?;
-        curr.defend(self.next.load(Acquire, guard), Some(&self.next), guard)?;
+        curr.defend_fake(Shared::from(C::element_of(self) as *const _));
 
         Ok(Iter {
             guard,
             pred,
             curr,
+            succ: self.next.load(Acquire, guard),
             is_detaching,
             is_stalled: false,
             _marker: PhantomData,
@@ -248,8 +258,8 @@ impl<T, C: IsElement<T>> List<T, C> {
     #[must_use]
     pub fn iter<'g>(
         &'g self,
-        pred: &'g mut Shield<Entry>,
-        curr: &'g mut Shield<Entry>,
+        pred: &'g mut Shield<T>,
+        curr: &'g mut Shield<T>,
         is_detaching: bool,
         guard: &'g Guard,
     ) -> Result<Iter<'g, T, C>, ShieldError> {
@@ -286,108 +296,75 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
             return Some(Err(IterError::Stalled));
         }
 
-        while let Some(succ) =
-            unsafe { self.curr.as_ref() }.map(|curr| curr.next.load(Acquire, self.guard))
-        {
-            if succ.tag() & 1 != 0 {
-                let succ = succ.with_tag(0);
+        while !self.succ.is_null() {
+            debug_assert_eq!(self.succ.tag(), 0);
 
-                // If this iterator is not detaching marked-as-removed nodes, ignore the `self.curr`
-                // and continue.
-                if !self.is_detaching {
-                    if succ.is_null() {
-                        self.pred.release();
-                        self.curr.release();
-                        return None;
-                    }
+            // Move one step forward.
+            mem::swap(&mut self.pred, &mut self.curr);
+            if let Err(e) = self.curr.defend_derived(
+                unsafe { element_of_shared::<T, C>(self.succ) },
+                Some(&C::entry_of(unsafe { &self.pred.deref() }).next),
+                |p| unsafe { element_of_shared::<T, C>(p) },
+                self.guard,
+            ) {
+                return Some(Err(IterError::ShieldError(e)));
+            }
 
-                    mem::swap(&mut self.pred, &mut self.curr);
-                    if let Err(e) =
-                        self.curr
-                            .defend(succ, Some(&unsafe { self.pred.deref() }.next), self.guard)
-                    {
-                        return Some(Err(IterError::ShieldError(e)));
-                    }
+            let curr_ref = unsafe { self.curr.deref() };
+            self.succ = C::entry_of(curr_ref).next.load(Acquire, self.guard);
 
-                    continue;
-                }
+            // Ignores a removed node if this iterator is not detaching it.
+            if self.succ.tag() & 1 != 0 && !self.is_detaching {
+                continue;
+            }
 
-                // This entry was removed. Try unlinking it from the list.
-                //
-                // The tag should never be zero, because removing a node after a logically deleted
-                // node leaves the list in an invalid state.
-                debug_assert_eq!(self.curr.tag(), 0);
-
-                match &unsafe { self.pred.deref() }.next.compare_and_set(
-                    self.curr.shared(),
-                    succ,
-                    AcqRel,
-                    self.guard,
-                ) {
+            // Detaches a removed node.
+            if self.succ.tag() & 1 != 0 && self.is_detaching {
+                let succ = self.succ.with_tag(0);
+                match C::entry_of(unsafe { self.pred.deref() })
+                    .next
+                    .compare_and_set(
+                        unsafe { entry_of_shared::<T, C>(self.curr.shared()) },
+                        succ,
+                        AcqRel,
+                        self.guard,
+                    )
+                {
                     Ok(_) => {
                         // We succeeded in unlinking this element from the list, so we have to
                         // schedule deallocation. Deferred drop is okay, because `list.delete()` can
                         // only be called if `T: 'static`.
                         unsafe {
-                            C::finalize(&*self.curr.as_raw(), self.guard);
+                            C::finalize(C::entry_of(&*self.curr.as_raw()), self.guard);
                         }
 
-                        // Move over the removed by only advancing `curr`, not `pred`.
-                        if succ.is_null() {
-                            self.curr.release();
-                        } else {
-                            if let Err(e) = self.curr.defend(
-                                succ,
-                                Some(&unsafe { self.pred.deref() }.next),
-                                self.guard,
-                            ) {
-                                return Some(Err(IterError::ShieldError(e)));
-                            }
-                        }
-
-                        continue;
+                        mem::swap(&mut self.pred, &mut self.curr);
+                        self.succ = succ;
                     }
                     Err(e) => {
-                        if e.current.tag() == 0 {
-                            if e.current.is_null() {
-                                self.curr.release();
-                            } else {
-                                if let Err(e) = self.curr.defend(
-                                    e.current,
-                                    Some(&unsafe { self.pred.deref() }.next),
-                                    self.guard,
-                                ) {
-                                    return Some(Err(IterError::ShieldError(e)));
-                                }
-                            }
-                            continue;
+                        // A concurrent thread modified the predecessor node. If it is deleted, we need
+                        // to restart from `head`.
+                        if e.current.tag() != 0 {
+                            self.pred.release();
+                            self.curr.release();
+                            self.is_stalled = true;
+                            return Some(Err(IterError::Stalled));
                         }
 
-                        // A concurrent thread modified the predecessor node. Since it might've been
-                        // deleted, we need to restart from `head`.
-                        self.is_stalled = true;
-                        return Some(Err(IterError::Stalled));
+                        mem::swap(&mut self.pred, &mut self.curr);
+                        self.succ = e.current;
                     }
                 }
+                continue;
             }
 
-            // Move one step forward.
-            mem::swap(&mut self.pred, &mut self.curr);
-            if succ.is_null() {
-                self.curr.release();
-            } else {
-                if let Err(e) =
-                    self.curr
-                        .defend(succ, Some(&unsafe { self.pred.deref() }.next), self.guard)
-                {
-                    return Some(Err(IterError::ShieldError(e)));
-                }
-            }
-
-            return Some(Ok(unsafe { C::element_of(self.pred.deref()) }));
+            self.pred.release();
+            return Some(Ok(unsafe { self.curr.deref() }));
         }
 
         // We reached the end of the list.
+        self.pred.release();
+        self.curr.release();
         None
     }
 }
@@ -583,11 +560,11 @@ mod tests {
                     b.wait();
 
                     let handle = collector.register();
-                    let guard: Guard = handle.pin();
+                    let mut guard: Guard = handle.pin();
                     let mut v = Vec::with_capacity(ITERS);
 
                     for _ in 0..ITERS {
-                        let e = Owned::new(Entry::default()).into_shared(&guard);
+                        let e = Owned::new(Entry::default()).into_shared(unsafe { unprotected() });
                         v.push(e);
                         unsafe {
                             l.insert(e);
