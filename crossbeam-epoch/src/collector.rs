@@ -87,6 +87,7 @@ impl LocalHandle {
         unsafe { (*self.local).collector() }
     }
 
+    /// Returns the number of retired and yet unreclaimed garbages.
     pub fn retired_unreclaimed(&self) -> i64 {
         unsafe { (*self.local).retired_unreclaimed() }
     }

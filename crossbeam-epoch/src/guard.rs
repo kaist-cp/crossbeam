@@ -4,6 +4,7 @@ use atomic::Shared;
 use collector::Collector;
 use deferred::Deferred;
 use garbage::Garbage;
+use hazard::ShieldError;
 use internal::Local;
 
 /// A guard that keeps the current thread pinned.
@@ -288,10 +289,21 @@ impl Guard {
         });
     }
 
-    pub fn collect(&self) {
+    /// Collects local (and sometimes global) garbages.
+    pub fn collect(&self) -> Result<(), ShieldError> {
         if let Some(local) = unsafe { self.local.as_ref() } {
-            local.collect(self);
+            local.collect(self)?;
         }
+        Ok(())
+    }
+
+    /// Collects local and global garbages.
+    pub fn collect_global(&self) -> Result<(), ShieldError> {
+        if let Some(local) = unsafe { self.local.as_ref() } {
+            local.collect(self)?;
+            let _ = local.global().collect(self);
+        }
+        Ok(())
     }
 
     /// Clears up the thread-local cache of deferred functions by executing them or moving into the
@@ -320,7 +332,7 @@ impl Guard {
     /// [`unprotected`]: fn.unprotected.html
     pub fn flush(&self) {
         if let Some(local) = unsafe { self.local.as_ref() } {
-            local.flush(self);
+            local.flush();
         }
     }
 

@@ -88,8 +88,6 @@ cfg_if! {
         #[macro_use]
         extern crate static_assertions;
         extern crate murmur3;
-        #[macro_use]
-        extern crate bitflags;
         extern crate membarrier;
 
         mod atomic;

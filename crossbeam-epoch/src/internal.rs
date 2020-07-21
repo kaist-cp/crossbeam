@@ -36,25 +36,22 @@
 //! destroyed as soon as the data structure gets dropped.
 
 use core::cell::{Cell, UnsafeCell};
-use core::cmp;
 use core::convert::TryInto;
 use core::mem::{self, ManuallyDrop};
-use core::num::Wrapping;
 use core::ptr;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_utils::CachePadded;
 use membarrier;
 
-use atomic::{Atomic, Owned, Shared};
+use atomic::{Owned, Shared};
 use bloom_filter::BloomFilter;
 use collector::{Collector, LocalHandle};
 use garbage::{Bag, Garbage};
 use guard::{unprotected, Guard};
 use hazard::{HazardSet, Shield, ShieldError};
-use sync::list::{repeat_iter, Entry, IsElement, List};
+use sync::list::{repeat_iter, Entry, IsElement, IterError, List};
 use sync::stack::Stack;
-use tag::*;
 
 /// The width of epoch's representation. In other words, there can be `1 << EPOCH_WIDTH` epochs that
 /// are wrapping around.
@@ -64,60 +61,6 @@ const EPOCH_WIDTH: u32 = 5;
 const BAGS_WIDTH: u32 = 3;
 
 const_assert!(bags_epoch_width; BAGS_WIDTH <= EPOCH_WIDTH);
-
-/// Compares two epochs.
-fn epoch_cmp(a: usize, b: usize) -> cmp::Ordering {
-    let diff = b.wrapping_sub(a) % (1 << EPOCH_WIDTH);
-    if diff == 0 {
-        cmp::Ordering::Equal
-    } else if diff < (1 << (EPOCH_WIDTH - 1)) {
-        cmp::Ordering::Less
-    } else {
-        cmp::Ordering::Greater
-    }
-}
-
-bitflags! {
-    /// Status flags tagged in a pointer to hazard pointer summary.
-    struct StatusFlags: usize {
-        const EJECTING = 1 << (EPOCH_WIDTH + 1);
-        const PINNED   = 1 << EPOCH_WIDTH;
-        const EPOCH    = (1 << EPOCH_WIDTH) - 1;
-    }
-}
-
-impl StatusFlags {
-    #[inline(always)]
-    pub fn new(is_ejecting: bool, is_pinned: bool, epoch: usize) -> Self {
-        debug_assert!(
-            StatusFlags::all().bits() <= low_bits::<CachePadded<BloomFilter>>(),
-            "StatusFlags should be tagged in a pointer to hazard pointer summary.",
-        );
-
-        let is_ejecting = if is_ejecting {
-            Self::EJECTING
-        } else {
-            Self::empty()
-        };
-        let is_pinned = if is_pinned {
-            Self::PINNED
-        } else {
-            Self::empty()
-        };
-        let epoch = Self::from_bits_truncate(epoch) & Self::EPOCH;
-        is_ejecting | is_pinned | epoch
-    }
-
-    #[inline(always)]
-    pub fn is_pinned(self) -> bool {
-        !(self & Self::PINNED).is_empty()
-    }
-
-    #[inline(always)]
-    pub fn epoch(self) -> usize {
-        (self & Self::EPOCH).bits()
-    }
-}
 
 /// The global data for a garbage collector.
 pub struct Global {
@@ -150,13 +93,56 @@ impl Global {
         self.bags.push(bag);
     }
 
-    pub fn collect_hazards(&self, guard: &Guard) -> Option<BloomFilter> {
+    #[inline]
+    fn collect_hazards_inner(&self, guard: &Guard) -> Result<Option<BloomFilter>, IterError> {
         // Heavy fence to synchronize with `Shield::defend()`.
         unsafe {
             membarrier::heavy_membarrier();
         }
 
-        todo!()
+        // Creates a summary of the set of hazard pointers.
+        let mut hazards: Option<BloomFilter> = None;
+        let mut pred = Shield::null(guard);
+        let mut curr = Shield::null(guard);
+
+        // TODO(stjepang): `Local`s are stored in a linked list because linked lists are fairly easy
+        // to implement in a lock-free manner. However, traversal can be slow due to cache misses
+        // and data dependencies. We should experiment with other data structures as well.
+        for local in self
+            .locals
+            .iter(&mut pred, &mut curr, true, guard)
+            .map_err(IterError::ShieldError)?
+        {
+            let local = local?;
+            let local = unsafe { &*local };
+
+            // If the corresponding thread is not pinned, ignore it.
+            if !local.status.load(Ordering::Acquire) {
+                continue;
+            }
+
+            // Creates a summary of the set of hazard pointers.
+            let local_hazards = repeat_iter(|| local.hazards.make_summary(false, &guard))
+                .map_err(IterError::ShieldError)?;
+            if let Some(local_hazards) = local_hazards {
+                if let Some(hazards) = hazards.as_mut() {
+                    hazards.union(&local_hazards);
+                }
+            }
+        }
+
+        Ok(hazards)
+    }
+
+    fn collect_hazards(&self, guard: &Guard) -> Result<Option<BloomFilter>, ShieldError> {
+        repeat_iter(|| self.collect_hazards_inner(guard))
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn collect<'g>(&'g self, guard: &'g Guard) -> Result<bool, ShieldError> {
+        let hazards = self.collect_hazards(guard)?;
+        self.collect_inner(hazards.as_ref(), guard)
     }
 
     /// Collects several bags from the global queue and executes deferred functions in them.
@@ -168,9 +154,11 @@ impl Global {
     /// `collect()` is not called.
     #[cold]
     #[must_use]
-    pub fn collect<'g>(&'g self, guard: &'g Guard) -> Result<bool, ShieldError> {
-        let summary = self.collect_hazards(guard);
-
+    pub fn collect_inner<'g>(
+        &'g self,
+        hazards: Option<&BloomFilter>,
+        guard: &'g Guard,
+    ) -> Result<bool, ShieldError> {
         let steps = if cfg!(feature = "sanitize") {
             usize::max_value()
         } else {
@@ -181,7 +169,7 @@ impl Global {
             if let Some(mut bag) = self.bags.try_pop(guard)? {
                 // Disposes the garbages (except for hazard pointers) in the bag popped from the
                 // global queue.
-                let disposed = bag.dispose(summary.as_ref());
+                let disposed = bag.dispose(hazards);
 
                 if let Some(local) = unsafe { guard.local.as_ref() } {
                     local.inc_reclaimed(disposed);
@@ -210,9 +198,8 @@ pub struct Local {
     /// A node in the intrusive linked list of `Local`s.
     entry: Entry,
 
-    /// The local status consisting of (1) the (approximate) summary of hazard pointers, and (2)
-    /// `StatusFlags`.
-    status: CachePadded<Atomic<CachePadded<BloomFilter>>>,
+    /// Whether the corresponding thread is accessing the shared memory.
+    status: AtomicBool,
 
     /// A reference to the global data.
     ///
@@ -231,7 +218,7 @@ pub struct Local {
     /// Total number of pinnings performed.
     ///
     /// This is just an auxiliary counter that sometimes kicks off collection.
-    pin_count: Cell<Wrapping<usize>>,
+    collect_count: Cell<usize>,
 
     /// The set of hazard pointers.
     pub(crate) hazards: HazardSet,
@@ -247,12 +234,11 @@ pub struct Local {
 }
 
 impl Local {
-    /// Number of pinnings after which a participant will execute some deferred functions from the
-    /// global queue.
-    const PINNINGS_BETWEEN_COLLECT: usize = 8;
-
     /// Maximum number of unreclaimed garbages.
     const MAX_GARBAGES: usize = 256;
+
+    /// How often should we call global collection?
+    const LOCAL_COLLECTS_BETWEEN_GLOBAL_COLLECT: usize = 8;
 
     /// Registers a new `Local` in the provided `Global`.
     pub fn register(collector: &Collector) -> LocalHandle {
@@ -261,13 +247,13 @@ impl Local {
 
             let local = Owned::new(Local {
                 entry: Entry::default(),
-                status: CachePadded::new(Atomic::null()),
+                status: AtomicBool::new(false),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
                 hazards: HazardSet::new(),
                 garbages: UnsafeCell::new(Vec::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
-                pin_count: Cell::new(Wrapping(0)),
+                collect_count: Cell::new(0),
                 retired: Cell::new(0),
                 reclaimed: Cell::new(0),
             })
@@ -322,13 +308,15 @@ impl Local {
         let garbages = &mut *self.garbages.get();
         garbages.push(garbage);
 
-        if garbages.len() > Self::MAX_GARBAGES {
-            self.collect(guard);
+        if garbages.len() >= Self::MAX_GARBAGES {
+            // We ignore possibly happening shield errors.
+            let _ = self.collect(guard);
         }
     }
 
-    pub fn collect(&self, guard: &Guard) {
-        let hazards = self.global().collect_hazards(guard);
+    #[cold]
+    pub fn collect(&self, guard: &Guard) -> Result<(), ShieldError> {
+        let hazards = self.global().collect_hazards(guard)?;
 
         let garbages = unsafe { &mut *self.garbages.get() };
         *garbages = garbages
@@ -342,9 +330,19 @@ impl Local {
                 }
             })
             .collect();
+
+        // Increment the pin counter.
+        let collect_count = self.collect_count.get().wrapping_add(1);
+        self.collect_count.set(collect_count);
+
+        if collect_count % Self::LOCAL_COLLECTS_BETWEEN_GLOBAL_COLLECT == 0 {
+            let _ = self.global().collect_inner(hazards.as_ref(), guard)?;
+        }
+
+        Ok(())
     }
 
-    pub fn flush(&self, guard: &Guard) {
+    pub fn flush(&self) {
         let garbages = unsafe { &mut *self.garbages.get() };
         let mut bag = Bag::new();
 
@@ -353,13 +351,11 @@ impl Local {
                 self.global().push_bag(&mut bag);
                 garbage = g;
             }
-
-            if !bag.is_empty() {
-                self.global().push_bag(&mut bag);
-            }
         }
 
-        let _ = self.global().collect(guard);
+        if !bag.is_empty() {
+            self.global().push_bag(&mut bag);
+        }
     }
 
     /// Pins the `Local`.
@@ -371,23 +367,8 @@ impl Local {
         self.guard_count.set(guard_count.checked_add(1).unwrap());
 
         if guard_count == 0 {
-            // Loads the current local status. It's safe not to protect the access because no other
-            // threads are modifying it.
-            let local_status = unsafe { self.status.load(Ordering::Relaxed, unprotected()) };
-            let local_flags = StatusFlags::from_bits_truncate(local_status.tag());
-            debug_assert!(
-                !local_flags.is_pinned(),
-                "[Local::pin()] `self` should be unpinned"
-            );
-
-            // Increment the pin counter.
-            let pin_count = self.pin_count.get();
-            self.pin_count.set(pin_count + Wrapping(1));
-
-            // After every `PINNINGS_BETWEEN_COLLECT` try collecting some old garbage bags.
-            if pin_count.0 % Self::PINNINGS_BETWEEN_COLLECT == 0 {
-                let _ = self.global().collect(&guard);
-            }
+            // Sets the corresponding thread as pinned.
+            self.status.store(true, Ordering::Relaxed);
         }
 
         guard
@@ -400,36 +381,8 @@ impl Local {
         debug_assert_ne!(guard_count, 0, "[Local::unpin()] guard count should be > 0");
 
         if guard_count == 1 {
-            unsafe {
-                // We don't need to be protected because we're not accessing the shared memory.
-                let guard = unprotected();
-
-                // Loads the current status.
-                let status = self.status.load(Ordering::Acquire, guard);
-                let flags = StatusFlags::from_bits_truncate(status.tag());
-
-                // Unpins `self` if it's not already unpinned.
-                if flags.is_pinned() {
-                    // Creates a summary of the set of hazard pointers.
-                    let new_status = repeat_iter(|| self.hazards.make_summary(true, guard))
-                        // `ShieldError` is impossible with the `unprotected()` guard.
-                        .unwrap()
-                        .map(|summary| Owned::new(CachePadded::new(summary)).into_shared(guard))
-                        .unwrap_or_else(|| Shared::null())
-                        .with_tag(StatusFlags::new(false, false, flags.epoch()).bits());
-
-                    // Replaces `self.status` with the new status.
-                    let old_status = self.status.swap(new_status, Ordering::AcqRel, guard);
-
-                    // Defers to destroy the old summary with a "fake" guard, and returns the new
-                    // status.
-                    if !old_status.is_null() {
-                        let guard = Guard { local: self };
-                        guard.defer_destroy(old_status);
-                        mem::forget(guard);
-                    }
-                }
-            }
+            // Sets the corresponding thread as unpinned.
+            self.status.store(false, Ordering::Release);
         }
 
         self.guard_count.set(guard_count - 1);
@@ -469,18 +422,10 @@ impl Local {
         // doesn't call `finalize` again.
         self.handle_count.set(1);
         let guard = Guard { local: self };
-        {
-            // Flushes the local garbages.
-            self.flush(&guard);
 
-            // Defers to destroy the local summary.
-            let local_status = self.status.load(Ordering::Relaxed, &guard);
-            if !local_status.is_null() {
-                unsafe {
-                    guard.defer_destroy(local_status);
-                }
-            }
-        }
+        // Flushes the local garbages.
+        self.flush();
+
         // Revert the handle count back to zero.
         mem::forget(guard);
         self.handle_count.set(0);
