@@ -332,7 +332,7 @@ impl Guard {
     /// [`unprotected`]: fn.unprotected.html
     pub fn flush(&self) {
         if let Some(local) = unsafe { self.local.as_ref() } {
-            local.flush();
+            local.flush(self);
         }
     }
 

@@ -99,7 +99,10 @@ impl<T> Queue<T> {
 
         loop {
             // We push onto the tail, so we'll start optimistically by looking there first.
-            if let Err(ShieldError::Ejected) = tail.defend(self.tail.load(Acquire, guard), guard) {
+            if tail
+                .defend(self.tail.load(Acquire, guard), Some(&self.tail), guard)
+                .is_err()
+            {
                 continue;
             }
 
@@ -115,18 +118,20 @@ impl<T> Queue<T> {
     #[must_use]
     fn pop_internal(
         &self,
-        shield: &mut Shield<Node<T>>,
+        shield1: &mut Shield<Node<T>>,
+        shield2: &mut Shield<Node<T>>,
         guard: &Guard,
     ) -> Result<Result<Option<T>, ()>, ShieldError> {
         // Access the head.
         let head = self.head.load(Acquire, guard);
-        shield.defend(head, guard)?;
+        shield1.defend(head, Some(&self.head), guard)?;
 
         // Access the next node to the head.
-        let next = unsafe { shield.deref() }.next.load(Acquire, guard);
-        shield.defend(next, guard)?;
+        let next = unsafe { shield1.deref() }.next.load(Acquire, guard);
 
-        Ok(match unsafe { shield.as_ref() } {
+        shield2.defend(next, Some(&unsafe { shield1.deref() }.next), guard)?;
+
+        Ok(match unsafe { shield2.as_ref() } {
             Some(n) => unsafe {
                 self.head
                     .compare_and_set(head, next, Release, guard)
@@ -145,9 +150,10 @@ impl<T> Queue<T> {
     /// Returns `None` if the queue is observed to be empty.
     #[must_use]
     pub fn try_pop(&self, guard: &Guard) -> Result<Option<T>, ShieldError> {
-        let mut shield = Shield::null(guard);
+        let mut shield1 = Shield::null(guard);
+        let mut shield2 = Shield::null(guard);
         loop {
-            if let Ok(head) = self.pop_internal(&mut shield, guard)? {
+            if let Ok(head) = self.pop_internal(&mut shield1, &mut shield2, guard)? {
                 return Ok(head);
             }
         }
@@ -202,7 +208,7 @@ mod test {
             loop {
                 match self.queue.try_pop(&guard) {
                     Ok(r) => return r,
-                    Err(ShieldError::Ejected) => guard.repin(),
+                    Err(_) => continue,
                 }
             }
         }

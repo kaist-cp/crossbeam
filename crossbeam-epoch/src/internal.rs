@@ -51,7 +51,7 @@ use garbage::{Bag, Garbage};
 use guard::{unprotected, Guard};
 use hazard::{HazardSet, Shield, ShieldError};
 use sync::list::{repeat_iter, Entry, IsElement, IterError, List};
-use sync::stack::Stack;
+use sync::queue::Queue;
 
 /// The width of epoch's representation. In other words, there can be `1 << EPOCH_WIDTH` epochs that
 /// are wrapping around.
@@ -68,7 +68,7 @@ pub struct Global {
     locals: List<Local>,
 
     /// The global pool of bags of deferred functions.
-    bags: CachePadded<Stack<Bag>>,
+    bags: CachePadded<Queue<Bag>>,
 }
 
 impl Global {
@@ -83,14 +83,14 @@ impl Global {
 
         Self {
             locals: List::new(),
-            bags: CachePadded::new(Stack::new()),
+            bags: CachePadded::new(Queue::new()),
         }
     }
 
     /// Pushes the bag into the global queue and replaces the bag with a new empty bag.
-    pub fn push_bag(&self, bag: &mut Bag) {
+    pub fn push_bag(&self, bag: &mut Bag, guard: &Guard) {
         let bag = mem::replace(bag, Bag::new());
-        self.bags.push(bag);
+        self.bags.push(bag, guard);
     }
 
     #[inline]
@@ -181,7 +181,7 @@ impl Global {
                 // If the bag is not empty (due to hazard pointers), push it back to the global
                 // queue.
                 if !bag.is_empty() {
-                    self.push_bag(&mut bag);
+                    self.push_bag(&mut bag, guard);
                 }
             } else {
                 return Ok(true);
@@ -342,19 +342,19 @@ impl Local {
         Ok(())
     }
 
-    pub fn flush(&self) {
+    pub fn flush(&self, guard: &Guard) {
         let garbages = unsafe { &mut *self.garbages.get() };
         let mut bag = Bag::new();
 
         for mut garbage in garbages.drain(..) {
             while let Err(g) = unsafe { bag.try_push(garbage) } {
-                self.global().push_bag(&mut bag);
+                self.global().push_bag(&mut bag, guard);
                 garbage = g;
             }
         }
 
         if !bag.is_empty() {
-            self.global().push_bag(&mut bag);
+            self.global().push_bag(&mut bag, guard);
         }
     }
 
@@ -424,7 +424,7 @@ impl Local {
         let guard = Guard { local: self };
 
         // Flushes the local garbages.
-        self.flush();
+        self.flush(&guard);
 
         // Revert the handle count back to zero.
         mem::forget(guard);

@@ -150,7 +150,7 @@ mod tests {
                 let a = Owned::new(7).into_shared(guard);
                 guard.defer_destroy(a);
 
-                assert!(!(*(*guard.local).bag.get()).is_empty());
+                // assert!(!(*(*guard.local).bag.get()).is_empty());
                 guard.flush();
             }
         }
@@ -168,7 +168,7 @@ mod tests {
                 let a = Owned::new(7).into_shared(guard);
                 guard.defer_destroy(a);
             }
-            assert!(!(*(*guard.local).bag.get()).is_empty());
+            // assert!(!(*(*guard.local).bag.get()).is_empty());
         }
     }
 
@@ -330,7 +330,6 @@ mod tests {
         }
 
         while DROPS.load(Ordering::Relaxed) < COUNT {
-            guard.repin();
             collector.global.collect(&guard);
         }
         assert_eq!(DROPS.load(Ordering::Relaxed), COUNT);

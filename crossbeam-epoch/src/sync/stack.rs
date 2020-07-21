@@ -111,7 +111,7 @@ mod test {
                                     assert!(r.is_some());
                                     break;
                                 }
-                                Err(_) => guard.repin(),
+                                Err(_) => continue,
                             }
                         }
                     }
