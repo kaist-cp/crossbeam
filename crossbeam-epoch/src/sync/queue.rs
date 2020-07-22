@@ -5,7 +5,7 @@
 //! Michael and Scott.  Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue
 //! Algorithms.  PODC 1996.  http://dl.acm.org/citation.cfm?id=248106
 
-use core::mem::{self, ManuallyDrop};
+use core::mem::{self, ManuallyDrop, MaybeUninit};
 use core::ptr;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
@@ -30,7 +30,7 @@ struct Node<T> {
     /// For example, the sentinel node in a queue never contains a value: its slot is always empty.
     /// Other nodes start their life with a push operation and contain a value until it gets popped
     /// out. After that such empty nodes get added to the collector for destruction.
-    data: ManuallyDrop<T>,
+    data: MaybeUninit<T>,
 
     next: Atomic<Node<T>>,
 }
@@ -47,7 +47,7 @@ impl<T> Queue<T> {
             tail: CachePadded::new(Atomic::null()),
         };
         let sentinel = Owned::new(Node {
-            data: unsafe { mem::uninitialized() },
+            data: MaybeUninit::uninit(),
             next: Atomic::null(),
         });
         unsafe {
@@ -91,7 +91,7 @@ impl<T> Queue<T> {
     #[must_use]
     pub fn push(&self, t: T, guard: &Guard) -> Result<(), ShieldError> {
         let new = Owned::new(Node {
-            data: ManuallyDrop::new(t),
+            data: MaybeUninit::new(t),
             next: Atomic::null(),
         })
         .into_shared(guard);
@@ -153,7 +153,7 @@ impl<T> Queue<T> {
             unsafe {
                 guard.defer_destroy(head);
             }
-            return Ok(Ok(Some(ManuallyDrop::into_inner(data))));
+            return Ok(Ok(Some(unsafe { MaybeUninit::assume_init(data) })));
         }
 
         Ok(Err(()))
