@@ -64,16 +64,16 @@ impl<T> Stack<T> {
                 Some(h) => {
                     let next = h.next.load(Relaxed, guard);
 
+                    let data = unsafe { ptr::read(&(*h).data) };
                     if self
                         .head
                         .compare_and_set(head, next, Release, guard)
                         .is_ok()
                     {
                         unsafe {
-                            let data = ManuallyDrop::into_inner(ptr::read(&(*h).data));
                             guard.defer_destroy(head);
-                            return Ok(Some(data));
                         }
+                        return Ok(Some(ManuallyDrop::into_inner(data)));
                     }
                 }
                 None => return Ok(None),

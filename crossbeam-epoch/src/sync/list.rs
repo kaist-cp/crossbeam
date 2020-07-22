@@ -328,8 +328,7 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
                         succ,
                         AcqRel,
                         self.guard,
-                    )
-                {
+                    ) {
                     Ok(_) => {
                         // We succeeded in unlinking this element from the list, so we have to
                         // schedule deallocation. Deferred drop is okay, because `list.delete()` can

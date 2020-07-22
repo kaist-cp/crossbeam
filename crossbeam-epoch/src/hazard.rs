@@ -614,7 +614,7 @@ impl<T> Shield<T> {
         guard: &'g Guard,
     ) -> Result<(), ShieldError>
     where
-        C: FnOnce(Shared<U>) -> Shared<T>
+        C: FnOnce(Shared<U>) -> Shared<T>,
     {
         let data = ptr.into_usize();
         self.data = data;

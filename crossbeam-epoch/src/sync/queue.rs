@@ -127,27 +127,29 @@ impl<T> Queue<T> {
         shield1.defend(head, Some(&self.head), guard)?;
 
         // Access the next node to the head.
-        let next = unsafe { shield1.deref() }.next.load(Acquire, guard);
+        let next = unsafe { shield1.as_ref().unwrap() }
+            .next
+            .load(Acquire, guard);
         if next.is_null() {
             return Ok(Ok(None));
         }
-        shield2.defend(next, Some(&unsafe { shield1.deref() }.next), guard)?;
+        shield2.defend(
+            next,
+            Some(&unsafe { shield1.as_ref().unwrap() }.next),
+            guard,
+        )?;
 
         let tail = self.tail.load(Relaxed, guard);
         if head == tail {
-            let _ = self
-                .tail
-                .compare_and_set(tail, next, Release, guard);
+            let _ = self.tail.compare_and_set(tail, next, Release, guard);
         }
 
+        let data = unsafe { ptr::read(&shield2.deref().data) };
         if self
             .head
             .compare_and_set(head, next, Release, guard)
             .is_ok()
         {
-            let data = unsafe {
-                ptr::read(&shield2.deref().data)
-            };
             unsafe {
                 guard.defer_destroy(head);
             }
