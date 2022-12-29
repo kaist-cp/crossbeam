@@ -108,6 +108,7 @@ impl Drop for Bag {
 
 /// A pair of an epoch and a bag.
 #[derive(Default, Debug)]
+#[allow(dead_code)]
 struct SealedBag {
     epoch: Epoch,
     bag: Bag,
