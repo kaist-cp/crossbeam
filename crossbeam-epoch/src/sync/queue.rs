@@ -139,25 +139,25 @@ impl<T> Queue<T> {
         let head = self.head.load(Acquire, guard);
         let h = unsafe { head.deref() };
         let next = h.next.load(Acquire, guard);
-        unsafe {
-            match next.as_ref() {
-                Some(n) if condition(&*n.data.as_ptr()) => {
-                    self.head
-                        .compare_and_set(head, next, Release, guard)
-                        .map(|_| {
-                            let tail = self.tail.load(Relaxed, guard);
-                            // Advance the tail so that we don't retire a pointer to a reachable node.
-                            if head == tail {
-                                let _ = self.tail.compare_and_set(tail, next, Release, guard);
-                            }
+        match unsafe { next.as_ref() } {
+            Some(n) if unsafe { condition(&*n.data.as_ptr()) } => {
+                self.head
+                    .compare_and_set(head, next, Release, guard)
+                    .map(|_| {
+                        let tail = self.tail.load(Relaxed, guard);
+                        // Advance the tail so that we don't retire a pointer to a reachable node.
+                        if head == tail {
+                            let _ = self.tail.compare_and_set(tail, next, Release, guard);
+                        }
+                        unsafe {
                             guard.defer_destroy(head);
                             // TODO: Replace with MaybeUninit::read when api is stable
                             Some(n.data.as_ptr().read())
-                        })
-                        .map_err(|_| ())
-                }
-                None | Some(_) => Ok(None),
+                        }
+                    })
+                    .map_err(|_| ())
             }
+            None | Some(_) => Ok(None),
         }
     }
 
