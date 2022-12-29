@@ -14,7 +14,7 @@ use guard::Guard;
 /// Given ordering for the success case in a compare-exchange operation, returns the strongest
 /// appropriate ordering for the failure case.
 #[inline]
-fn strongest_failure_ordering(ord: Ordering) -> Ordering {
+pub fn strongest_failure_ordering(ord: Ordering) -> Ordering {
     use self::Ordering::*;
     match ord {
         Relaxed | Release => Relaxed,

@@ -8,6 +8,7 @@
 //! participant will hold a reference to it. That is the crux of safe memory reclamation.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use atomic::strongest_failure_ordering;
 
 /// An epoch that can be marked as pinned or unpinned.
 ///
@@ -108,7 +109,9 @@ impl AtomicEpoch {
     /// The `Ordering` argument describes the memory ordering of this operation.
     #[inline]
     pub fn compare_and_swap(&self, current: Epoch, new: Epoch, ord: Ordering) -> Epoch {
-        let data = self.data.compare_and_swap(current.data, new.data, ord);
-        Epoch { data }
+        let data = self.data.compare_exchange(current.data, new.data, ord, strongest_failure_ordering(ord));
+        match data {
+            Ok(data) | Err(data) => Epoch { data }
+        }
     }
 }
