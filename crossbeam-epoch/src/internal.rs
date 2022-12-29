@@ -93,7 +93,7 @@ impl Bag {
 
     /// Seals the bag with the given epoch.
     fn seal(self, epoch: Epoch) -> SealedBag {
-        SealedBag { epoch, bag: self }
+        SealedBag { epoch, _bag: self }
     }
 }
 
@@ -108,10 +108,11 @@ impl Drop for Bag {
 
 /// A pair of an epoch and a bag.
 #[derive(Default, Debug)]
-#[allow(dead_code)]
 struct SealedBag {
     epoch: Epoch,
-    bag: Bag,
+    /// `bag` of `SealedBag` is never read.
+    /// It exists to drop inner `Bag` when its `SealedBag` becomes unreachable.
+    _bag: Bag,
 }
 
 /// It is safe to share `SealedBag` because `is_expired` only inspects the epoch.
