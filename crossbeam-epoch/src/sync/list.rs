@@ -66,7 +66,7 @@ pub struct Entry {
 ///
 pub trait IsElement<T> {
     /// Returns a reference to this element's `Entry`.
-    fn entry_of(&T) -> &Entry;
+    fn entry_of(_: &T) -> &Entry;
 
     /// Given a reference to an element's entry, returns that element.
     ///
@@ -80,7 +80,7 @@ pub trait IsElement<T> {
     ///
     /// The caller has to guarantee that the `Entry` is called with was retrieved from an instance
     /// of the element type (`T`).
-    unsafe fn element_of(&Entry) -> &T;
+    unsafe fn element_of(_: &Entry) -> &T;
 
     /// The function that is called when an entry is unlinked from list.
     ///
@@ -88,7 +88,7 @@ pub trait IsElement<T> {
     ///
     /// The caller has to guarantee that the `Entry` is called with was retrieved from an instance
     /// of the element type (`T`).
-    unsafe fn finalize(&Entry, &Guard);
+    unsafe fn finalize(_: &Entry, _: &Guard);
 }
 
 /// A lock-free, intrusive linked list of type `T`.
