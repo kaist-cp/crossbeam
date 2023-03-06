@@ -39,7 +39,7 @@ use core::cell::{Cell, UnsafeCell};
 use core::cmp;
 use core::mem::{self, ManuallyDrop};
 use core::ptr;
-use core::sync::atomic::{self, Ordering};
+use core::sync::atomic::{self, Ordering, AtomicUsize};
 use core::ops::Deref;
 
 use crossbeam_utils::CachePadded;
@@ -54,6 +54,9 @@ use hazard::{HazardSet, Shield, ShieldError};
 use sync::list::{repeat_iter, Entry, IsElement, IterError, List};
 use sync::stack::Stack;
 use tag::*;
+
+#[allow(missing_docs)]
+pub static GLOBAL_GARBAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// The width of epoch's representation. In other words, there can be `1 << EPOCH_WIDTH` epochs that
 /// are wrapping around.
@@ -176,6 +179,7 @@ impl Global {
 
     /// Pushes the bag into the global queue and replaces the bag with a new empty bag.
     pub fn push_bag(&self, bag: &mut Bag, index: usize) {
+        GLOBAL_GARBAGE_COUNT.fetch_add(bag.len(), Ordering::AcqRel);
         let bags = unsafe { &*self.bags.get_unchecked(index % (1 << BAGS_WIDTH)) };
         let bag = mem::replace(bag, Bag::new());
         bags.push(bag);
@@ -204,6 +208,7 @@ impl Global {
             if let Some(mut bag) = bags.try_pop(guard)? {
                 // Disposes the garbages (except for hazard pointers) in the bag popped from the
                 // global queue.
+                GLOBAL_GARBAGE_COUNT.fetch_sub(bag.len(), Ordering::AcqRel);
                 bag.dispose(summary);
 
                 // If the bag is not empty (due to hazard pointers), push it back to the global

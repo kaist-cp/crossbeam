@@ -121,3 +121,5 @@ cfg_if! {
         pub use self::default::{default_collector, is_pinned, pin};
     }
 }
+
+pub use self::internal::GLOBAL_GARBAGE_COUNT;

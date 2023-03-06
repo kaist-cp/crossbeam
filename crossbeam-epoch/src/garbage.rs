@@ -60,6 +60,10 @@ impl Bag {
         self.garbages.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.garbages.len()
+    }
+
     /// Attempts to insert a deferred function into the bag.
     ///
     /// Returns `Ok(())` if successful, and `Err(deferred)` for the given `deferred` if the bag is
