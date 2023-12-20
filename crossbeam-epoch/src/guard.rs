@@ -557,6 +557,6 @@ pub unsafe fn unprotected() -> &'static mut Guard {
     // not implement `Sync`. To get around the problem, we create a static `usize` initialized to
     // zero and then transmute it into a `Guard`. This is safe because `usize` and `Guard`
     // (consisting of a single pointer) have the same representation in memory.
-    static UNPROTECTED: usize = 0;
-    &mut *(&UNPROTECTED as *const _ as *const _ as *mut Guard)
+    static mut UNPROTECTED: usize = 0;
+    &mut *(&mut UNPROTECTED as *mut usize as *mut Guard)
 }
