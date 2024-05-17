@@ -558,5 +558,5 @@ pub unsafe fn unprotected() -> &'static mut Guard {
     // zero and then transmute it into a `Guard`. This is safe because `usize` and `Guard`
     // (consisting of a single pointer) have the same representation in memory.
     static mut UNPROTECTED: usize = 0;
-    &mut *(&mut UNPROTECTED as *mut usize as *mut Guard)
+    &mut *(core::ptr::addr_of_mut!(UNPROTECTED) as *mut usize as *mut Guard)
 }
