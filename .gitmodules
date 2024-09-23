@@ -1,6 +1,0 @@
-[submodule "crossbeam-epoch/deps/membarrier-rs"]
-	path = crossbeam-epoch/deps/membarrier-rs
-	url = https://github.com/jeehoonkang/membarrier-rs
-[submodule "crossbeam-epoch/deps/murmur3"]
-	path = crossbeam-epoch/deps/murmur3
-	url = https://github.com/kaist-cp/murmur3.git

@@ -28,8 +28,13 @@ memoffset = "0.7"
 static_assertions = "0.3.2"
 bitflags = "1.0"
 
-membarrier = { path = "./deps/membarrier-rs" }
-murmur3 = { path = "./deps/murmur3" }
+[dependencies.membarrier]
+git = "https://github.com/jeehoonkang/membarrier-rs.git"
+rev = "99254da47b6dab382c9860a024cab3ab9bac6504"
+
+[dependencies.murmur3]
+git = "https://github.com/kaist-cp/murmur3.git"
+branch = "upgrade"
 
 [dependencies.arrayvec]
 version = "0.4"
