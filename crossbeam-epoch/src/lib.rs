@@ -109,6 +109,7 @@ cfg_if! {
         pub use self::collector::{Collector, LocalHandle};
         pub use self::guard::{unprotected, Guard};
         pub use self::hazard::{Shield, ShieldError};
+        pub use self::garbage::{bag_capacity, set_bag_capacity};
     }
 }
 

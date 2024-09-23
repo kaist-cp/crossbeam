@@ -38,9 +38,9 @@
 use core::cell::{Cell, UnsafeCell};
 use core::cmp;
 use core::mem::{self, ManuallyDrop};
-use core::ptr;
-use core::sync::atomic::{self, Ordering, AtomicUsize};
 use core::ops::Deref;
+use core::ptr;
+use core::sync::atomic::{self, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
 use membarrier;
@@ -48,7 +48,7 @@ use membarrier;
 use atomic::{Atomic, Owned, Shared};
 use bloom_filter::BloomFilter;
 use collector::{Collector, LocalHandle};
-use garbage::{Bag, Garbage};
+use garbage::{bag_capacity, Bag, Garbage};
 use guard::{unprotected, Guard};
 use hazard::{HazardSet, Shield, ShieldError};
 use sync::list::{repeat_iter, Entry, IsElement, IterError, List};
@@ -402,26 +402,23 @@ pub struct Local {
 }
 
 impl Local {
-    /// Number of pinnings after which a participant will execute some deferred functions from the
-    /// global queue.
-    #[cfg(not(feature = "sanitize"))]
-    const COUNTS_BETWEEN_COLLECT: usize = 64;
-    #[cfg(feature = "sanitize")]
-    const COUNTS_BETWEEN_COLLECT: usize = 2;
+    /// Returns the number of pinnings after which a participant will execute some deferred
+    /// functions from the global queue.
+    pub fn counts_between_collect() -> usize {
+        bag_capacity()
+    }
 
-    /// Number of pinnings after which a participant will try to advance the global epoch.
-    #[cfg(not(feature = "sanitize"))]
-    const COUNTS_BETWEEN_TRY_ADVANCE: usize = 128;
-    #[cfg(feature = "sanitize")]
-    const COUNTS_BETWEEN_TRY_ADVANCE: usize = 4;
+    /// Returns the number of pinnings after which a participant will try to advance the
+    /// global epoch.
+    pub fn counts_between_try_advance() -> usize {
+        2 * bag_capacity()
+    }
 
-    /// Number of pinnings after which a participant will force to advance the global epoch.
-    #[cfg(not(feature = "sanitize"))]
-    const COUNTS_BETWEEN_FORCE_ADVANCE: usize = 4 * 128;
-    #[cfg(feature = "sanitize")]
-    const COUNTS_BETWEEN_FORCE_ADVANCE: usize = 8;
-
-    const_assert_eq!(pinnings_between_try_force_advance; Local::COUNTS_BETWEEN_FORCE_ADVANCE % Local::COUNTS_BETWEEN_TRY_ADVANCE, 0);
+    /// Returns the number of pinnings after which a participant will force to advance the global
+    /// epoch.
+    pub fn counts_between_force_advance() -> usize {
+        4 * Self::counts_between_try_advance()
+    }
 
     /// Registers a new `Local` in the provided `Global`.
     pub fn register(collector: &Collector) -> LocalHandle {
@@ -482,9 +479,7 @@ impl Local {
         // HACK(@jeehoonkang): It is inside a very hot loop, but LLVM cannot optimize the above
         // lines...
         let tag = local_status.tag();
-        if tag & StatusFlags::PINNED.bits() != 0 &&
-            tag & StatusFlags::EJECTING.bits() == 0
-        {
+        if tag & StatusFlags::PINNED.bits() != 0 && tag & StatusFlags::EJECTING.bits() == 0 {
             Ok(tag & StatusFlags::EPOCH.bits())
         } else {
             Err(ShieldError::Ejected)
@@ -511,14 +506,16 @@ impl Local {
         let advance_count = self.advance_count.get().wrapping_add(1);
         self.advance_count.set(advance_count);
 
-        if advance_count % Self::COUNTS_BETWEEN_TRY_ADVANCE == 0 {
+        if advance_count % Self::counts_between_try_advance() == 0 {
             let local_status = self.status.load(Ordering::Acquire, guard);
             let local_flags = StatusFlags::from_bits_truncate(local_status.tag());
-            let is_forcing = advance_count % Self::COUNTS_BETWEEN_FORCE_ADVANCE == 0;
-            let _ = self.global().advance(local_flags.epoch(), is_forcing, &guard);
+            let is_forcing = advance_count % Self::counts_between_force_advance() == 0;
+            let _ = self
+                .global()
+                .advance(local_flags.epoch(), is_forcing, &guard);
         }
         // After every `COUNTS_BETWEEN_COLLECT` try collecting some old garbage bags.
-        else if is_forcing || collect_count % Self::COUNTS_BETWEEN_COLLECT == 0 {
+        else if is_forcing || collect_count % Self::counts_between_collect() == 0 {
             let _ = self.global().collect(&guard);
         }
     }
@@ -529,6 +526,10 @@ impl Local {
     ///
     /// It should be safe for another thread to execute the given function.
     pub unsafe fn defer(&self, mut garbage: Garbage, guard: &Guard, internal: bool) {
+        debug_assert_eq!(
+            Self::counts_between_force_advance() % Local::counts_between_try_advance(),
+            0
+        );
         let bag = &mut *self.bag.get();
 
         while let Err(g) = bag.try_push(garbage) {
@@ -601,10 +602,12 @@ impl Local {
                     // very differently from SC accesses), but experimental evidence suggests that
                     // this works fine.  Using inline assembly would be a viable (and correct)
                     // alternative, but alas, that is not possible on stable Rust.
-                    if let Err(e) = self
-                        .status
-                        .compare_and_set(local_status, new_status, Ordering::SeqCst, &guard)
-                    {
+                    if let Err(e) = self.status.compare_and_set(
+                        local_status,
+                        new_status,
+                        Ordering::SeqCst,
+                        &guard,
+                    ) {
                         local_status = e.current;
                         continue;
                     } else {
@@ -616,10 +619,12 @@ impl Local {
                     // should go a long way.
                     atomic::compiler_fence(Ordering::SeqCst);
                 } else {
-                    if let Err(e) = self
-                        .status
-                        .compare_and_set(local_status, new_status, Ordering::AcqRel, &guard)
-                    {
+                    if let Err(e) = self.status.compare_and_set(
+                        local_status,
+                        new_status,
+                        Ordering::AcqRel,
+                        &guard,
+                    ) {
                         local_status = e.current;
                         continue;
                     } else {
@@ -670,7 +675,9 @@ impl Local {
                 // Update status only if `self` is not already unpinned.
                 if flags.is_pinned() {
                     // Creates a summary of the set of hazard pointers.
-                    let new_status = self.hazards.make_summary(true, guard)
+                    let new_status = self
+                        .hazards
+                        .make_summary(true, guard)
                         // `IterError` is impossible with the `unprotected()` guard.
                         .unwrap()
                         .map(|summary| Owned::new(CachePadded::new(summary)).into_shared(guard))
@@ -765,7 +772,9 @@ impl Local {
         }
 
         // Heavy fence to synchronize with `Self::get_epoch()`.
-        unsafe { membarrier::heavy_membarrier(); }
+        unsafe {
+            membarrier::heavy_membarrier();
+        }
 
         // Protects the current status to prevent the ABA problem.
         let _shield = Shield::new(status, guard)?;
@@ -789,23 +798,24 @@ impl Local {
             .with_tag(StatusFlags::new(true, false, flags.epoch()).bits());
 
         // Replaces the old status with the new one.
-        let return_status = match self
-            .status
-            .compare_and_set(status, new_status, Ordering::AcqRel, guard)
-        {
-            Ok(_) => unsafe {
-                if !status.is_null() {
-                    guard.defer_destroy(status);
-                }
-                new_status
-            },
-            Err(e) => unsafe {
-                if !e.new.is_null() {
-                    drop(e.new.into_owned());
-                }
-                e.current
-            },
-        };
+        let return_status =
+            match self
+                .status
+                .compare_and_set(status, new_status, Ordering::AcqRel, guard)
+            {
+                Ok(_) => unsafe {
+                    if !status.is_null() {
+                        guard.defer_destroy(status);
+                    }
+                    new_status
+                },
+                Err(e) => unsafe {
+                    if !e.new.is_null() {
+                        drop(e.new.into_owned());
+                    }
+                    e.current
+                },
+            };
 
         Ok(return_status)
     }

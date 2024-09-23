@@ -1,13 +1,26 @@
-use arrayvec::ArrayVec;
-
 use bloom_filter::BloomFilter;
 use deferred::Deferred;
 
 /// Maximum number of objects a bag can contain.
 #[cfg(not(feature = "sanitize"))]
-const MAX_OBJECTS: usize = 64;
+static mut MAX_OBJECTS: usize = 64;
 #[cfg(feature = "sanitize")]
-const MAX_OBJECTS: usize = 4;
+static mut MAX_OBJECTS: usize = 4;
+
+/// Sets the capacity of thread-local garbage bag.
+/// 
+/// This value applies to all threads.
+#[inline]
+pub fn set_bag_capacity(cap: usize) {
+    assert!(cap > 1, "capacity must be greater than 1.");
+    unsafe { MAX_OBJECTS = cap };
+}
+
+/// Returns the current capacity of thread-local garbage bag.
+#[inline]
+pub fn bag_capacity() -> usize {
+    unsafe { MAX_OBJECTS }
+}
 
 /// A garbage to be collected.
 // TODO(@jeehoonkang): I hope the layout of `Garbage` be optimized, as each case has a nonzero
@@ -40,14 +53,22 @@ impl Garbage {
 }
 
 /// A bag of deferred functions.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Bag {
     /// Stashed garbages.
-    garbages: ArrayVec<[Garbage; MAX_OBJECTS]>,
+    garbages: Vec<Garbage>,
 }
 
 /// `Bag::try_push()` requires that it is safe for another thread to execute the given functions.
 unsafe impl Send for Bag {}
+
+impl Default for Bag {
+    fn default() -> Self {
+        Self {
+            garbages: Vec::with_capacity(bag_capacity()),
+        }
+    }
+}
 
 impl Bag {
     /// Returns a new, empty bag.
@@ -73,7 +94,11 @@ impl Bag {
     ///
     /// It should be safe for another thread to execute the given function.
     pub unsafe fn try_push(&mut self, garbage: Garbage) -> Result<(), Garbage> {
-        self.garbages.try_push(garbage).map_err(|e| e.element())
+        if self.garbages.len() < bag_capacity() {
+            self.garbages.push(garbage);
+            return Ok(());
+        }
+        Err(garbage)
     }
 
     /// Disposes the bag except for hazard pointers.
@@ -89,7 +114,7 @@ impl Bag {
                     None
                 }
             })
-            .collect::<ArrayVec<_>>();
+            .collect::<Vec<_>>();
         self.garbages = hazards;
     }
 }
@@ -106,14 +131,14 @@ impl Drop for Bag {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
-    use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
     use deferred::Deferred;
 
     #[test]
     fn check_bag() {
-        static FLAG: AtomicUsize = ATOMIC_USIZE_INIT;
+        static FLAG: AtomicUsize = AtomicUsize::new(0);
         fn incr() {
             FLAG.fetch_add(1, Ordering::Relaxed);
         }
@@ -121,7 +146,7 @@ mod tests {
         let mut bag = Bag::new();
         assert!(bag.is_empty());
 
-        for _ in 0..MAX_OBJECTS {
+        for _ in 0..bag_capacity() {
             assert!(unsafe {
                 bag.try_push(Garbage::Deferred {
                     inner: Deferred::new(incr),
@@ -142,6 +167,6 @@ mod tests {
         assert_eq!(FLAG.load(Ordering::Relaxed), 0);
 
         drop(bag);
-        assert_eq!(FLAG.load(Ordering::Relaxed), MAX_OBJECTS);
+        assert_eq!(FLAG.load(Ordering::Relaxed), bag_capacity());
     }
 }
