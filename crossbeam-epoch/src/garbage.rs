@@ -1,25 +1,26 @@
 use bloom_filter::BloomFilter;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use deferred::Deferred;
 
 /// Maximum number of objects a bag can contain.
 #[cfg(not(feature = "sanitize"))]
-static mut MAX_OBJECTS: usize = 64;
+static MAX_OBJECTS: AtomicUsize = AtomicUsize::new(64);
 #[cfg(feature = "sanitize")]
-static mut MAX_OBJECTS: usize = 4;
+static MAX_OBJECTS: AtomicUsize = AtomicUsize::new(4);
 
 /// Sets the capacity of thread-local garbage bag.
-/// 
+///
 /// This value applies to all threads.
 #[inline]
 pub fn set_bag_capacity(cap: usize) {
     assert!(cap > 1, "capacity must be greater than 1.");
-    unsafe { MAX_OBJECTS = cap };
+    MAX_OBJECTS.store(cap, Ordering::Relaxed);
 }
 
 /// Returns the current capacity of thread-local garbage bag.
 #[inline]
 pub fn bag_capacity() -> usize {
-    unsafe { MAX_OBJECTS }
+    MAX_OBJECTS.load(Ordering::Relaxed)
 }
 
 /// A garbage to be collected.
@@ -130,8 +131,8 @@ impl Drop for Bag {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use super::*;
     use deferred::Deferred;
